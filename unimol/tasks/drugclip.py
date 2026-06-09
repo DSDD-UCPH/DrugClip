@@ -1750,7 +1750,7 @@ class DrugCLIP(UnicoreTask):
                     mol_names.extend(sample["smi_name"])
                 mol_reps = np.concatenate(mol_reps, axis=0)
                 with open(mol_cache_path, "wb") as f:
-                    pickle.dump([mol_reps, mol_ids_subsets], f)
+                    pickle.dump([mol_reps, mol_names], f)
 
             
 
