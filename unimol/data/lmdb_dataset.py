@@ -6,20 +6,53 @@
 import lmdb
 import os
 import pickle
+import time
 from functools import lru_cache
 import logging
 import numpy as np
+import zstandard as zstd
 
 logger = logging.getLogger(__name__)
 
+# zstd frame magic; used to detect compressed LMDB values from sdf_to_lmdb.
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
+
+
+def _loads_lmdb_value(raw):
+    """Unpickle an LMDB value, decompressing zstd frames when present."""
+    if raw is None:
+        return None
+    if len(raw) >= 4 and raw[:4] == _ZSTD_MAGIC:
+        raw = _ZSTD_DECOMPRESSOR.decompress(raw)
+    return pickle.loads(raw)
+
 
 class LMDBDataset:
-    def __init__(self, db_path):
+    def __init__(self, db_path, readahead=False):
         self.db_path = db_path
+        self.readahead = bool(readahead)
         assert os.path.isfile(self.db_path), "{} not found".format(self.db_path)
         env = self.connect_db(self.db_path)
-        with env.begin() as txn:
-            self._keys = list(txn.cursor().iternext(values=False))
+        try:
+            with env.begin() as txn:
+                # Prefer O(1) entry count for numeric-key libs ("0".."N-1"). Full key
+                # walks are minutes on 10M+ HDD LMDBs and are only needed for __len__.
+                n_entries = txn.stat()["entries"]
+                if n_entries > 0 and self._is_numeric_key_layout(txn, n_entries):
+                    self._keys = None
+                    self._length = n_entries
+                else:
+                    self._keys = list(txn.cursor().iternext(values=False))
+                    self._length = len(self._keys)
+        finally:
+            env.close()
+
+    @staticmethod
+    def _is_numeric_key_layout(txn, n_entries):
+        first = txn.get(b"0")
+        last = txn.get(str(n_entries - 1).encode("ascii"))
+        return first is not None and last is not None
 
     def connect_db(self, lmdb_path, save_to_self=False):
         env = lmdb.open(
@@ -27,7 +60,7 @@ class LMDBDataset:
             subdir=False,
             readonly=True,
             lock=False,
-            readahead=False,
+            readahead=self.readahead,
             meminit=False,
             max_readers=256,
         )
@@ -37,17 +70,163 @@ class LMDBDataset:
             self.env = env
 
     def __len__(self):
-        return len(self._keys)
+        return self._length
+
+    def close(self):
+        # Release the process-local LMDB env (LMDB allows only one open handle
+        # per path per process). Safe to call multiple times.
+        env = getattr(self, "env", None)
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
+            try:
+                del self.env
+            except AttributeError:
+                pass
+        try:
+            self.__getitem__.cache_clear()
+        except Exception:
+            pass
+
+    def get_raw(self, idx):
+        # Return the stored value bytes without unpickling (for byte-copy compaction).
+        # May be raw pickle or zstd-framed pickle; callers that need a dict should
+        # use __getitem__ / _loads_lmdb_value instead.
+        if not hasattr(self, "env"):
+            self.connect_db(self.db_path, save_to_self=True)
+        if self._keys is not None:
+            key = self._keys[idx]
+        else:
+            key = f"{idx}".encode("ascii")
+        return self.env.begin().get(key)
 
     @lru_cache(maxsize=16)
     def __getitem__(self, idx):
-        if not hasattr(self, "env"):
-            self.connect_db(self.db_path, save_to_self=True)
-        #datapoint_pickled = self.env.begin().get(f"{idx}".encode("ascii"))
-        #print(idx)
-        datapoint_pickled = self.env.begin().get(f"{idx}".encode("ascii"))
-        data = pickle.loads(datapoint_pickled)
-        return data
+        return _loads_lmdb_value(self.get_raw(idx))
+
+
+def compact_lmdb_indices(src_path, indices, dst_path, src_readahead=True):
+    """Copy selected LMDB entries into a new sequential LMDB (keys \"0\"..).
+
+    Values are copied as raw pickled blobs (no unpickle/re-pickle). `indices`
+    are source integer indices into a numeric-key library, or positions into
+    the key list for non-numeric layouts.
+    """
+    t0 = time.perf_counter()
+    src = LMDBDataset(src_path, readahead=src_readahead)
+    src.connect_db(src.db_path, save_to_self=True)
+    n_src = len(src)
+    n_out = len(indices)
+    src_size = os.path.getsize(src_path)
+    frac = (n_out / n_src) if n_src > 0 else 1.0
+    # Size for the survivor subset plus headroom; LMDB map_size is an upper bound.
+    map_size = max(int(src_size * frac * 1.5) + 64 * 1024 * 1024, 256 * 1024 * 1024)
+    bytes_written = 0
+
+    def _open_out(size):
+        return lmdb.open(
+            dst_path,
+            subdir=False,
+            readonly=False,
+            lock=False,
+            readahead=False,
+            meminit=False,
+            map_size=size,
+        )
+
+    def _key_for(src_i):
+        src_i = int(src_i)
+        if src._keys is not None:
+            return src._keys[src_i]
+        return f"{src_i}".encode("ascii")
+
+    env_out = _open_out(map_size)
+    # Larger commits: fewer fsyncs on multi-million survivor copies.
+    commit_every = 50000
+    # First index not yet committed; on MapFullError resume here (no full replay).
+    start_i = 0
+    txn_out = env_out.begin(write=True)
+    try:
+        with src.env.begin() as txn_in:
+            while start_i < n_out:
+                try:
+                    for out_i in range(start_i, n_out):
+                        raw = txn_in.get(_key_for(indices[out_i]))
+                        if raw is None:
+                            raise KeyError(
+                                f"missing LMDB key for index {indices[out_i]} in {src_path}"
+                            )
+                        txn_out.put(f"{out_i}".encode("ascii"), raw)
+                        bytes_written += len(raw)
+                        if (out_i + 1) % commit_every == 0:
+                            txn_out.commit()
+                            start_i = out_i + 1
+                            txn_out = env_out.begin(write=True)
+                    txn_out.commit()
+                    start_i = n_out
+                except lmdb.MapFullError as e:
+                    try:
+                        txn_out.abort()
+                    except Exception:
+                        pass
+                    env_out.close()
+                    # Estimate remaining bytes from the failed raw if available.
+                    map_size = max(map_size * 2, map_size + 256 * 1024 * 1024)
+                    logger.warning(
+                        f"compact LMDB map full at {start_i}/{n_out}; "
+                        f"growing map_size to {map_size} and resuming "
+                        f"(dst={dst_path})"
+                    )
+                    env_out = _open_out(map_size)
+                    txn_out = env_out.begin(write=True)
+                    if start_i >= n_out:
+                        raise e
+    except Exception:
+        try:
+            txn_out.abort()
+        except Exception:
+            pass
+        env_out.close()
+        raise
+    env_out.sync()
+    env_out.close()
+    elapsed = time.perf_counter() - t0
+    mols_per_sec = n_out / elapsed if elapsed > 0 else 0.0
+    mb = bytes_written / (1024 * 1024)
+    logger.info(
+        f"compact_lmdb_indices: wrote {n_out} mols ({mb:.1f} MiB raw) to {dst_path} "
+        f"in {elapsed:.2f}s ({mols_per_sec:.0f} mols/s, map_size={map_size})"
+    )
+    return n_out
+
+
+def resolve_mol_smiles(db_path, indices, readahead=False):
+    """Return SMILES strings for integer LMDB indices (one read transaction)."""
+    ds = LMDBDataset(db_path, readahead=readahead)
+    ds.connect_db(ds.db_path, save_to_self=True)
+    out = []
+    with ds.env.begin() as txn:
+        for idx in indices:
+            idx = int(idx)
+            if ds._keys is not None:
+                key = ds._keys[idx]
+            else:
+                key = f"{idx}".encode("ascii")
+            raw = txn.get(key)
+            if raw is None:
+                out.append("")
+                continue
+            data = _loads_lmdb_value(raw)
+            if "smiles" in data:
+                out.append(data["smiles"])
+            elif "smi" in data:
+                out.append(data["smi"])
+            else:
+                out.append("")
+    ds.close()
+    return out
 
 
 import logging
