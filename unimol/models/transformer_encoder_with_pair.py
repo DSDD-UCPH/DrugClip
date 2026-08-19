@@ -141,3 +141,40 @@ class TransformerEncoderWithPair(nn.Module):
             delta_pair_repr = self.final_head_layer_norm(delta_pair_repr)
 
         return x, attn_mask, delta_pair_repr, x_norm, delta_pair_repr_norm
+
+    def forward_repr(
+        self,
+        emb: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Inference-only path: return token representations without computing
+        # delta_pair_repr, norm losses, or the (bsz, L, L, heads) pair tensors.
+        # return_attn must stay True: each layer feeds the previous layer's
+        # pre-softmax scores forward as attn_bias (the trained Uni-Mol behavior);
+        # return_attn=False would change the CLS embedding.
+        seq_len = emb.size(1)
+        x = self.emb_layer_norm(emb)
+        x = F.dropout(x, p=self.emb_dropout, training=self.training)
+
+        if padding_mask is not None:
+            x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
+
+        assert attn_mask is not None
+        if padding_mask is not None:
+            attn_mask = attn_mask.view(x.size(0), -1, seq_len, seq_len)
+            attn_mask = attn_mask.masked_fill(
+                padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool),
+                float("-inf"),
+            )
+            attn_mask = attn_mask.view(-1, seq_len, seq_len)
+            padding_mask = None
+
+        for layer in self.layers:
+            x, attn_mask, _ = layer(
+                x, padding_mask=padding_mask, attn_bias=attn_mask, return_attn=True
+            )
+
+        if self.final_layer_norm is not None:
+            x = self.final_layer_norm(x)
+        return x

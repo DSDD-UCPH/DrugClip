@@ -362,32 +362,29 @@ class AffinityMolDataset(BaseWrapperDataset):
 
     @lru_cache(maxsize=16)
     def __cached_item__(self, index: int, epoch: int):
-        #print(self.dataset[index])
-        atoms = np.array(self.dataset[index][self.atoms])
-        #print(atoms)
+        # Single underlying LMDB/dataset fetch — nested field access must not
+        # re-enter self.dataset[index] (each call unpickles on the hot path).
+        data = self.dataset[index]
+        atoms = np.array(data[self.atoms])
         ori_length = len(atoms)
-       
-        #coordinates = self.dataset[index][self.coordinates]
-        size = len(self.dataset[index][self.coordinates])
-        #print(size)
+
+        size = len(data[self.coordinates])
         with data_utils.numpy_seed(self.seed, epoch, index):
             sample_idx = np.random.randint(size)
         # check coordinates is 2 dimension or not
-        if len(self.dataset[index][self.coordinates][sample_idx].shape) == 2:
-            coordinates = self.dataset[index][self.coordinates][sample_idx]
+        if len(data[self.coordinates][sample_idx].shape) == 2:
+            coordinates = data[self.coordinates][sample_idx]
         else:
-            coordinates = self.dataset[index][self.coordinates]
-        #coordinates = self.dataset[index][self.coordinates][sample_idx]
-        #coordinates = self.dataset[index][self.coordinates]
+            coordinates = data[self.coordinates]
 
         # resize coordinates to n x 3
 
         if len(coordinates.shape) == 1:
             coordinates = np.reshape(coordinates, (-1, 3))
-        if "smiles" in self.dataset[index]:
-            smi = self.dataset[index]["smiles"]
-        elif "smi" in self.dataset[index]:
-            smi = self.dataset[index]["smi"]
+        if "smiles" in data:
+            smi = data["smiles"]
+        elif "smi" in data:
+            smi = data["smi"]
         else:
             smi = ""
         return {

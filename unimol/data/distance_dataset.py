@@ -2,9 +2,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import numpy as np
 import torch
-from scipy.spatial import distance_matrix
 from functools import lru_cache
 from unicore.data import BaseWrapperDataset
 
@@ -16,9 +14,10 @@ class DistanceDataset(BaseWrapperDataset):
 
     @lru_cache(maxsize=16)
     def __getitem__(self, idx):
-        pos = self.dataset[idx].view(-1, 3).numpy()
-        dist = distance_matrix(pos, pos).astype(np.float32)
-        return torch.from_numpy(dist)
+        pos = self.dataset[idx].view(-1, 3)
+        # Vectorized pairwise distances (avoids scipy); fine for L≲50 molecules.
+        dist = torch.cdist(pos.float(), pos.float())
+        return dist.to(dtype=torch.float32)
 
 
 class EdgeTypeDataset(BaseWrapperDataset):
@@ -42,12 +41,12 @@ class CrossDistanceDataset(BaseWrapperDataset):
 
     @lru_cache(maxsize=16)
     def __getitem__(self, idx):
-        mol_pos = self.mol_dataset[idx].view(-1, 3).numpy()
-        pocket_pos = self.pocket_dataset[idx].view(-1, 3).numpy()
-        dist = distance_matrix(mol_pos, pocket_pos).astype(np.float32)
-        assert dist.shape[0] == self.mol_dataset[idx].shape[0]
-        assert dist.shape[1] == self.pocket_dataset[idx].shape[0]
-        return torch.from_numpy(dist)
+        mol_pos = self.mol_dataset[idx].view(-1, 3)
+        pocket_pos = self.pocket_dataset[idx].view(-1, 3)
+        dist = torch.cdist(mol_pos.float(), pocket_pos.float())
+        assert dist.shape[0] == mol_pos.shape[0]
+        assert dist.shape[1] == pocket_pos.shape[0]
+        return dist.to(dtype=torch.float32)
 
 class CrossEdgeTypeDataset(BaseWrapperDataset):
     def __init__(self, mol_dataset, pocket_dataset, num_types: int):

@@ -40,7 +40,7 @@ from .conformer_sample_dataset import (
 from .mask_points_dataset import MaskPointsDataset, MaskPointsPocketDataset
 from .coord_pad_dataset import RightPadDatasetCoord, RightPadDatasetCross2D
 from .from_str_dataset import FromStrLabelDataset
-from .lmdb_dataset import LMDBDataset, LMDBDatasetV2, LMDBKeyDataset
+from .lmdb_dataset import LMDBDataset, LMDBDatasetV2, LMDBKeyDataset, compact_lmdb_indices, resolve_mol_smiles
 from .prepend_and_append_2d_dataset import PrependAndAppend2DDataset
 from .affinity_dataset import AffinityDataset, AffinityTestDataset, AffinityValidDataset, AffinityMolDataset, AffinityPocketDataset, AffinityHNSDataset, AffinityAugDataset
 from .pocket2mol_dataset import FragmentConformationDataset
