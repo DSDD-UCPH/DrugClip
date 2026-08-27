@@ -1,8 +1,15 @@
 #!/bin/bash
 ###
-# If you set use_cache=True, then we will use the pre-encoded mols for screening.
-# This is default for all the wet-lab experiment targets.
-# Else, please set the MOL_PATH to a lmdb path as the screening library.
+# use_cache=True: create-or-reuse mol embeddings under
+#   ./data/encoded_mol_embs/<fold_version>/fold{i}.npy (float16 mmap) plus names.npy.
+#   If that complete npy set (or a legacy complete fold{i}.pkl set) exists, score
+#   from it with no LMDB encode. If not, one fused encode scores the current
+#   pockets and writes the npy cache.
+# use_cache=False: ignore mol caches. One fused score pass only; do not read or
+# write fold* mol files. MOL_PATH must be an LMDB screening library.
+#
+# WRITE_CACHE persists pocket embeddings only. Score memmaps are always deleted
+# after ranking (scratch only).
 ###
 
 
@@ -33,8 +40,9 @@ CASCADE_TIER_FRACS=1.0,0.5
 # Fold index used by each gating tier (padded with remaining folds if shorter).
 CASCADE_GATE_FOLDS=4,1
 
-# Persist pocket embeddings to disk (both modes). Score memmaps are always
-# removed after results are written; they are scratch only. Optional SSD root:
+# Persist pocket embeddings to disk (both modes). Mol fold npy is gated by
+# use_cache, not WRITE_CACHE. Score memmaps are always removed after results
+# are written; they are scratch only. Optional SSD root:
 #   export DRUGCLIP_SCORE_MEMMAP_DIR=/path/to/ssd/scratch/score_memmap
 # Pocket caches live under:
 #   ./data/encoded_pocket_embs/<fold_version>/pocket_cache/<pocket_file>_<hash>/

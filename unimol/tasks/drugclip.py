@@ -33,6 +33,7 @@ from unimol.data.lmdb_dataset import (
 )
 from unimol.tasks._drugclip_rank import (
     _SCORE_MEMMAP_SELECT_CHUNK,
+    _pickle_score_chunk_size,
     _score_memmap_dtype,
     _cascade_score_memmap_dtype,
     _cascade_anchor_sample_size,
@@ -142,14 +143,94 @@ class DrugCLIP(UnicoreTask):
         ]
 
     @staticmethod
-    def _mol_cache_paths(fold_version):
+    def _n_folds_for(fold_version):
         if fold_version not in _FOLD_VERSION_SPECS:
             raise ValueError(f"unknown fold_version: {fold_version}")
-        _, n_folds = _FOLD_VERSION_SPECS[fold_version]
+        return _FOLD_VERSION_SPECS[fold_version][1]
+
+    @staticmethod
+    def _mol_emb_cache_dir(fold_version):
+        if fold_version not in _FOLD_VERSION_SPECS:
+            raise ValueError(f"unknown fold_version: {fold_version}")
+        return f"./data/encoded_mol_embs/{fold_version}"
+
+    @classmethod
+    def _mol_pkl_cache_paths(cls, fold_version):
+        n_folds = cls._n_folds_for(fold_version)
+        cache_dir = cls._mol_emb_cache_dir(fold_version)
         return [
-            f"./data/encoded_mol_embs/{fold_version}/fold{i}.pkl"
-            for i in range(n_folds)
+            os.path.join(cache_dir, f"fold{i}.pkl") for i in range(n_folds)
         ]
+
+    @classmethod
+    def _mol_npy_cache_paths(cls, fold_version):
+        n_folds = cls._n_folds_for(fold_version)
+        cache_dir = cls._mol_emb_cache_dir(fold_version)
+        return {
+            "dir": cache_dir,
+            "names": os.path.join(cache_dir, "names.npy"),
+            "folds": [
+                os.path.join(cache_dir, f"fold{i}.npy") for i in range(n_folds)
+            ],
+        }
+
+    @classmethod
+    def _mol_cache_ready(cls, fold_version):
+        npy = cls._mol_npy_cache_paths(fold_version)
+        pkl = cls._mol_pkl_cache_paths(fold_version)
+        npy_ready = all(os.path.exists(p) for p in npy["folds"]) and os.path.exists(
+            npy["names"]
+        )
+        pkl_ready = all(os.path.exists(p) for p in pkl)
+        return npy_ready, pkl_ready
+
+    def _load_mol_fold_cache(self, fold_version):
+        """Load complete mol embedding cache: npy mmap preferred, else pickle.
+
+        Returns (reps_by_fold, names, kind) where kind is "npy" or "pkl".
+        """
+        npy_ready, pkl_ready = self._mol_cache_ready(fold_version)
+        if npy_ready:
+            npy = self._mol_npy_cache_paths(fold_version)
+            reps = {
+                i: np.load(path, mmap_mode="r")
+                for i, path in enumerate(npy["folds"])
+            }
+            n_mols = int(reps[0].shape[0])
+            if not os.path.exists(npy["names"]):
+                raise RuntimeError(
+                    f"mol npy cache missing names sidecar: {npy['names']}"
+                )
+            names = list(np.load(npy["names"], allow_pickle=True))
+            if len(names) != n_mols:
+                raise RuntimeError(
+                    f"mol cache names length {len(names)} != n_mols {n_mols}"
+                )
+            logger.info(
+                f"loaded mol npy cache from {npy['dir']} "
+                f"({len(reps)} fold(s), n={n_mols}, dtype={reps[0].dtype})"
+            )
+            return reps, names, "npy"
+        if pkl_ready:
+            pkl_paths = self._mol_pkl_cache_paths(fold_version)
+            reps = {}
+            names = None
+            for i, path in enumerate(pkl_paths):
+                with open(path, "rb") as f:
+                    fold_reps, fold_names = pickle.load(f)
+                reps[i] = fold_reps
+                names = fold_names
+            names = list(names)
+            logger.info(
+                f"loaded mol pickle cache from {os.path.dirname(pkl_paths[0])} "
+                f"({len(reps)} fold(s), n={len(names)})"
+            )
+            return reps, names, "pkl"
+        npy = self._mol_npy_cache_paths(fold_version)
+        raise FileNotFoundError(
+            f"incomplete mol cache under {npy['dir']} "
+            f"(need all fold{{i}}.npy or all fold{{i}}.pkl)"
+        )
 
     def _mol_graph_from_apo(self, apo_dataset):
         # Tokenize / distance nest pieces from a dataset with normalized
@@ -1147,14 +1228,21 @@ class DrugCLIP(UnicoreTask):
         n_written=0,
         run_label=None,
         flush_interval=50,
+        write_mol_cache=False,
+        fold_version=None,
     ):
         # Stream the molecule library through all resident fold encoders in one
         # DataLoader pass. Per batch, compute the fold-mean pocket@mol score on
         # GPU and write columns into the on-disk memmap. Never materializes
         # (n_mols x emb_dim) embeddings or a full (n_pockets x n_mols) host array.
+        # When write_mol_cache, also stream float16 fold{i}.npy memmaps.
         n_mols = len(mol_dataset)
         n_pockets = memmap.shape[0]
         dtype = memmap.dtype
+        if write_mol_cache:
+            if not fold_version:
+                raise ValueError("write_mol_cache requires fold_version")
+            n_written = 0
         if n_written >= n_mols:
             names = self._load_names_sidecar(paths, n_mols)
             if names is None:
@@ -1211,8 +1299,11 @@ class DrugCLIP(UnicoreTask):
             f"fused fold-mean scoring{label_suffix}: iterations={n_iters}, "
             f"folds={n_folds}, batch_size={bsz}, "
             f"molecules={remaining} (resume_from={n_written})"
+            f"{', writing mol npy cache' if write_mol_cache else ''}"
         )
         offset = n_written
+        emb_mms = None
+        npy_paths = None
         if use_cuda:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1221,18 +1312,47 @@ class DrugCLIP(UnicoreTask):
                 if use_cuda:
                     sample = unicore.utils.move_to_cuda(sample)
                 mean_score = None
+                batch_len = None
                 for fold, (fold_mol_model, fold_mol_project) in fold_encoders.items():
                     emb = self._encode_mol_batch_tensor(
                         fold_mol_model, fold_mol_project, sample
-                    ).float()
-                    score = pocket_t_by_fold[fold] @ emb.t()
+                    )
+                    if batch_len is None:
+                        batch_len = int(emb.shape[0])
+                    if write_mol_cache:
+                        if emb_mms is None:
+                            emb_dim = int(emb.shape[-1])
+                            npy_paths = self._mol_npy_cache_paths(fold_version)
+                            os.makedirs(npy_paths["dir"], exist_ok=True)
+                            # Drop names.npy first so a crash mid-write cannot
+                            # look like a complete cache (folds + stale names).
+                            if os.path.exists(npy_paths["names"]):
+                                os.remove(npy_paths["names"])
+                            emb_mms = []
+                            for path in npy_paths["folds"]:
+                                emb_mms.append(
+                                    np.lib.format.open_memmap(
+                                        path,
+                                        mode="w+",
+                                        dtype=np.float16,
+                                        shape=(n_mols, emb_dim),
+                                    )
+                                )
+                            logger.info(
+                                f"writing mol npy cache under {npy_paths['dir']} "
+                                f"(shape=({n_mols}, {emb_dim}), dtype=float16)"
+                            )
+                        emb_mms[int(fold)][offset:offset + batch_len] = (
+                            emb.detach().to(torch.float16).cpu().numpy()
+                        )
+                    emb_f = emb.float()
+                    score = pocket_t_by_fold[fold] @ emb_f.t()
                     if mean_score is None:
                         mean_score = score
                     else:
                         mean_score = mean_score + score
                 mean_score = mean_score / float(n_folds)
                 score_np = mean_score.detach().cpu().numpy().astype(dtype, copy=False)
-                batch_len = score_np.shape[1]
                 memmap[:, offset:offset + batch_len] = score_np
                 names_acc.extend(sample["smi_name"])
                 offset += batch_len
@@ -1241,11 +1361,22 @@ class DrugCLIP(UnicoreTask):
                     self._flush_score_memmap_meta(
                         paths, n_pockets, n_mols, offset, dtype
                     )
+                    if emb_mms is not None:
+                        for mm in emb_mms:
+                            mm.flush()
         if use_cuda:
             torch.cuda.synchronize()
         memmap.flush()
         self._flush_score_memmap_meta(paths, n_pockets, n_mols, offset, dtype)
         self._write_names_sidecar(paths, names_acc)
+        if emb_mms is not None:
+            for mm in emb_mms:
+                mm.flush()
+            np.save(npy_paths["names"], np.asarray(names_acc, dtype=object))
+            logger.info(
+                f"wrote mol npy cache names ({len(names_acc)}) to {npy_paths['names']}"
+            )
+            del emb_mms
         elapsed = time.perf_counter() - t0
         mols_per_sec = remaining / elapsed if elapsed > 0 else 0.0
         logger.info(
@@ -1269,46 +1400,81 @@ class DrugCLIP(UnicoreTask):
         chunk_size=None,
     ):
         # Chunked fold-mean matmul from pre-encoded per-fold embeddings into the
-        # score memmap. Avoids uploading the whole library (or allocating a full
-        # score matrix) at once. Used by the use_cache=True path.
+        # score memmap. Batched fp16 bmm on GPU; mmap npy is not fully loaded.
         if chunk_size is None:
-            chunk_size = _SCORE_MEMMAP_SELECT_CHUNK
-        n_folds = len(mol_reps_by_fold)
+            chunk_size = _pickle_score_chunk_size()
+        fold_ids = sorted(mol_reps_by_fold.keys())
+        n_folds = len(fold_ids)
         n_pockets, n_mols = memmap.shape
         dtype = memmap.dtype
+        emb_dim = int(mol_reps_by_fold[fold_ids[0]].shape[1])
         device = torch.device("cuda") if use_cuda else torch.device("cpu")
-        pocket_t_by_fold = {
-            fold: torch.from_numpy(
-                np.ascontiguousarray(pocket_reps_by_fold[fold])
-            ).to(device).float()
-            for fold in mol_reps_by_fold
-        }
         logger.info(
-            f"filling score memmap from pickles: folds={n_folds}, "
+            f"filling score memmap from cache: folds={n_folds}, "
             f"molecules={n_mols}, chunk={chunk_size}, cuda={use_cuda}"
         )
-        for start in tqdm(range(0, n_mols, chunk_size), desc="pickle->memmap"):
-            end = min(n_mols, start + chunk_size)
-            mean_score = None
-            for fold, reps in mol_reps_by_fold.items():
-                mol_chunk = np.ascontiguousarray(reps[start:end]).astype(np.float32, copy=False)
-                if use_cuda:
-                    mol_t = torch.from_numpy(mol_chunk).to(device)
-                    score = pocket_t_by_fold[fold] @ mol_t.t()
-                    score = score.detach().cpu().numpy()
-                    del mol_t
-                else:
-                    score = pocket_reps_by_fold[fold].astype(np.float32) @ mol_chunk.T
-                if mean_score is None:
-                    mean_score = score
-                else:
-                    mean_score = mean_score + score
-            mean_score = (mean_score / float(n_folds)).astype(dtype, copy=False)
-            memmap[:, start:end] = mean_score
+        t0 = time.perf_counter()
+        if use_cuda:
+            pocket_stack = np.stack(
+                [
+                    np.ascontiguousarray(pocket_reps_by_fold[f], dtype=np.float16)
+                    for f in fold_ids
+                ],
+                axis=0,
+            )
+            pocket_t = torch.from_numpy(pocket_stack).to(device)
+            mol_host = np.empty((n_folds, chunk_size, emb_dim), dtype=np.float16)
+            mol_t = None
+            for start in tqdm(range(0, n_mols, chunk_size), desc="cache->memmap"):
+                end = min(n_mols, start + chunk_size)
+                c = end - start
+                view = mol_host if c == chunk_size else mol_host[:, :c, :]
+                for i, fold in enumerate(fold_ids):
+                    sl = np.ascontiguousarray(
+                        mol_reps_by_fold[fold][start:end], dtype=np.float16
+                    )
+                    view[i] = sl
+                # Last chunk is a middle-axis slice of mol_host and is not
+                # C-contiguous; ascontiguousarray no-ops when c == chunk_size.
+                mol_t = torch.from_numpy(np.ascontiguousarray(view)).to(
+                    device, non_blocking=True
+                )
+                scores = torch.bmm(pocket_t, mol_t.transpose(1, 2))
+                mean = scores.float().mean(dim=0)
+                memmap[:, start:end] = mean.detach().cpu().numpy().astype(
+                    dtype, copy=False
+                )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            del pocket_t, mol_t, mol_host
+        else:
+            pocket_stack = np.stack(
+                [
+                    np.ascontiguousarray(pocket_reps_by_fold[f], dtype=np.float32)
+                    for f in fold_ids
+                ],
+                axis=0,
+            )
+            for start in tqdm(range(0, n_mols, chunk_size), desc="cache->memmap"):
+                end = min(n_mols, start + chunk_size)
+                c = end - start
+                mol_stack = np.empty((n_folds, c, emb_dim), dtype=np.float32)
+                for i, fold in enumerate(fold_ids):
+                    mol_stack[i] = np.ascontiguousarray(
+                        mol_reps_by_fold[fold][start:end], dtype=np.float32
+                    )
+                scores = np.matmul(pocket_stack, np.transpose(mol_stack, (0, 2, 1)))
+                mean = scores.mean(axis=0).astype(dtype, copy=False)
+                memmap[:, start:end] = mean
         memmap.flush()
         self._flush_score_memmap_meta(paths, n_pockets, n_mols, n_mols, dtype)
         self._write_names_sidecar(paths, names)
-        logger.info(f"wrote fold-mean score memmap ({n_pockets}x{n_mols}) from pickles")
+        elapsed = time.perf_counter() - t0
+        mols_per_sec = n_mols / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            f"wrote fold-mean score memmap ({n_pockets}x{n_mols}) from cache "
+            f"({mols_per_sec:.1f} mols/s)"
+        )
 
     def _select_topk_from_score_memmap(
         self, memmap, fold_version, names, save_path, chunk_size=None
@@ -1513,7 +1679,6 @@ class DrugCLIP(UnicoreTask):
 
     def retrieval_multi_folds(self, model, pocket_path, save_path, mol_data_path, fold_version, use_cache=True, use_cuda=True, retrieval_mode="full", cascade_frac=0.2, cascade_tier_fracs=None, cascade_gate_folds=None, write_cache=True, retrieval_bsz=None, **kwargs):
         ckpts = self._fold_checkpoints(fold_version)
-        caches = self._mol_cache_paths(fold_version)
 
         # Encode pockets once (cheap) up front; both retrieval modes need them.
         # load datasets once outside the fold loop to avoid re-opening the same lmdb environment
@@ -1533,10 +1698,11 @@ class DrugCLIP(UnicoreTask):
             )
             return
 
-        # Streaming full mode: one encode (or chunked pickle matmul) pass writes
+        # Streaming full mode: one encode (or chunked cache matmul) pass writes
         # fold-mean scores to an on-disk memmap; a cheap CPU pass then computes
-        # exact per-pocket median/MAD, max-over-pockets, and top-k. Never holds
-        # (n_mols x emb_dim) or (n_pockets x n_mols) arrays in RAM/VRAM.
+        # exact per-pocket median/MAD, max-over-pockets, and top-k.
+        # use_cache=True: create-or-reuse mol fold npy/pkl. False: fused score
+        # only, ignore mol caches. write_cache persists pocket embeddings only.
         use_fp16 = next(model.parameters()).dtype == torch.float16
         bsz = retrieval_bsz if retrieval_bsz and retrieval_bsz > 0 else _DEFAULT_RETRIEVAL_BSZ_FULL
 
@@ -1544,57 +1710,43 @@ class DrugCLIP(UnicoreTask):
             model, ckpts, pocket_data, pocket_path, fold_version, use_cuda, write_cache
         )
         n_pockets = next(iter(pocket_reps_by_fold.values())).shape[0]
-        n_folds = len(ckpts)
 
-        # Prefer a complete fold-mean score memmap cache when present.
         score_cache_dir = self._score_memmap_cache_dir(
             fold_version, mol_data_path, pocket_path
         )
-        # Resolve n_mols cheaply: dataset length, or a single pickle's name list,
-        # or an existing meta.npz — avoid loading all fold pickles up front.
+        npy_ready, pkl_ready = self._mol_cache_ready(fold_version)
+        caches_ready = npy_ready or pkl_ready
+        write_mol_cache = bool(use_cache) and not caches_ready
+        use_mol_cache = bool(use_cache) and caches_ready
+
         mol_dataset = None
         mol_reps_by_fold = {}
         mol_names = None
-        if use_cache:
-            paths_probe = self._score_memmap_paths(score_cache_dir)
-            n_mols = None
-            if os.path.exists(paths_probe["meta"]):
-                try:
-                    meta = np.load(paths_probe["meta"])
-                    if int(meta["n_pockets"]) == n_pockets:
-                        n_mols = int(meta["n_mols"])
-                except Exception:
-                    n_mols = None
-            if n_mols is None:
-                # Load fold-0 pickle just for library size / names.
-                if not os.path.exists(caches[0]):
-                    raise FileNotFoundError(
-                        f"use_cache=True but missing mol cache: {caches[0]}"
-                    )
-                with open(caches[0], "rb") as f:
-                    _, mol_names = pickle.load(f)
-                n_mols = len(mol_names)
+
+        if use_mol_cache:
+            mol_reps_by_fold, mol_names, _kind = self._load_mol_fold_cache(
+                fold_version
+            )
+            n_mols = len(mol_names)
         else:
             mol_dataset = self.load_mols_dataset(
                 mol_data_path, "atoms", "coordinates", readahead=True
             )
             n_mols = len(mol_dataset)
+            if write_mol_cache and os.path.isdir(score_cache_dir):
+                shutil.rmtree(score_cache_dir, ignore_errors=True)
 
         memmap, n_written, paths = self._open_or_create_score_memmap(
             score_cache_dir, n_pockets, n_mols
         )
+        if write_mol_cache:
+            n_written = 0
 
-        filled_this_run = False
         if n_written >= n_mols:
             names = self._load_names_sidecar(paths, n_mols)
             if names is None:
                 if mol_names is not None:
                     names = list(mol_names)
-                    self._write_names_sidecar(paths, names)
-                elif use_cache:
-                    with open(caches[0], "rb") as f:
-                        _, names = pickle.load(f)
-                    names = list(names)
                     self._write_names_sidecar(paths, names)
                 else:
                     raise RuntimeError(
@@ -1604,18 +1756,7 @@ class DrugCLIP(UnicoreTask):
                 f"reusing complete score memmap at {score_cache_dir} "
                 f"({n_pockets}x{n_mols}); skipping encode"
             )
-        elif use_cache:
-            # Load all fold pickles only when we actually need to fill the memmap.
-            for fold in range(n_folds):
-                mol_cache_path = caches[fold]
-                if not os.path.exists(mol_cache_path):
-                    raise FileNotFoundError(
-                        f"use_cache=True but missing mol cache: {mol_cache_path}"
-                    )
-                with open(mol_cache_path, "rb") as f:
-                    reps, names = pickle.load(f)
-                mol_reps_by_fold[fold] = reps
-                mol_names = names
+        elif use_mol_cache:
             self._fill_score_memmap_from_pickles(
                 mol_reps_by_fold,
                 pocket_reps_by_fold,
@@ -1626,9 +1767,7 @@ class DrugCLIP(UnicoreTask):
             )
             names = list(mol_names)
             mol_reps_by_fold.clear()
-            filled_this_run = True
         else:
-            # Snapshot every fold encoder once, then one fused DataLoader pass.
             fold_encoders = {}
             for fold, ckpt in enumerate(ckpts):
                 state = checkpoint_utils.load_checkpoint_to_cpu(ckpt)
@@ -1646,24 +1785,24 @@ class DrugCLIP(UnicoreTask):
                 paths,
                 n_written=n_written,
                 run_label="full retrieval",
+                write_mol_cache=write_mol_cache,
+                fold_version=fold_version if write_mol_cache else None,
             )
             fold_encoders.clear()
             if use_cuda:
                 torch.cuda.empty_cache()
-            filled_this_run = True
 
         self._select_topk_from_score_memmap(memmap, fold_version, names, save_path)
 
-        # Release the memmap handle. Delete scratch files only when this run
-        # filled them and the caller disabled persistence.
+        # Always drop score memmap scratch after ranking (pocket / mol caches
+        # may still be kept).
         del memmap
-        if filled_this_run and not write_cache:
-            for key in ("scores", "meta", "names", "names_txt"):
-                try:
-                    if os.path.exists(paths[key]):
-                        os.remove(paths[key])
-                except OSError:
-                    pass
+        try:
+            if os.path.isdir(score_cache_dir):
+                shutil.rmtree(score_cache_dir, ignore_errors=True)
+                logger.info(f"removed score memmap cache {score_cache_dir}")
+        except OSError:
+            pass
         return
 
     def _subset_mol_dataset(self, mol_dataset, indices):

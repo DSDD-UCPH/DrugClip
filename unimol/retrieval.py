@@ -100,12 +100,12 @@ def cli_main():
     def int_list(v):
         return [int(x) for x in str(v).split(",") if x.strip() != ""]
 
-    parser.add_argument("--use-cache", type=str2bool, default=False, help="whether use pre-encoded embeddings")
+    parser.add_argument("--use-cache", type=str2bool, default=False, help="if True, reuse a complete mol embedding cache (fold*.npy or legacy fold*.pkl) or write float16 npy during the fused score pass; if False, fused score only and ignore mol caches")
     parser.add_argument("--retrieval-mode", type=str, default="full", choices=["full", "cascade"], help="full: encode every fold over the whole library; cascade: configurable multi-tier gating that scores one fold per tier to progressively narrow the pool, then re-scores the surviving pool through all folds and ranks with the same procedure as full mode")
     parser.add_argument("--cascade-frac", type=float, default=0.2, help="tier-1 fraction of the library kept after the first gate in cascade mode; each tier's kept fraction is this value times the matching --cascade-tier-fracs multiplier")
     parser.add_argument("--cascade-tier-fracs", type=float_list, default=[1.0, 0.5, 0.25], help="comma-separated multipliers of --cascade-frac, one per gating tier (e.g. 1.0,0.5,0.25); the number of entries sets how many single-fold gating tiers run before the full-fold rescore")
     parser.add_argument("--cascade-gate-folds", type=int_list, default=[4, 1], help="comma-separated fold index used by each gating tier (e.g. 4,1); shorter than --cascade-tier-fracs is padded with the remaining unused folds in ascending order")
-    parser.add_argument("--write-cache", type=str2bool, default=True, help="whether to persist newly encoded score memmaps (full mode) and pocket embeddings (both modes) to disk")
+    parser.add_argument("--write-cache", type=str2bool, default=True, help="persist pocket embeddings to disk (both modes). Score memmaps are always deleted after ranking. Does not gate mol caches.")
     parser.add_argument("--retrieval-bsz", type=int, default=0, help="DataLoader batch size for molecule encoding/scoring; 0 uses the internal default (384 for full mode, 64 for cascade)")
     parser.add_argument("--prefetch-factor", type=int, default=4, help="DataLoader prefetch_factor when num_workers > 0 (default 4)")
     parser.add_argument("--save-path", type=str, default="", help="path for saved result")
