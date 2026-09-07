@@ -5,10 +5,25 @@
 Targeted at screening large multi-million-molecule LMDBs.
 
 - **Faster and smaller LMDB creation:** `sdf_to_lmdb.py` builds molecule LMDBs from 3D SDFs using float16 coords with support for output ZSTD compression; entries use compound names rather than SMILES (faster and saves storage). Pass `--workers N` (or `-w N`) to parse in a process pool (default `1` is single-threaded).
-- **Faster full-mode scoring:** score aggregation and ranking were rewritten for high throughput on large libraries, with scores that are nearly identical to the original path (bonus: lower memory utilization). Caching (when enabled) is now also done accross all folds simultaneously, cutting running time when generating the cache ~3-fold.
 - **Cascade mode (`--retrieval-mode cascade`):** for **single-target** on-the-fly screening. Cheap single-fold gates progressively shrink the library, then survivors are re-scored with all folds (same ranking as full mode). Typical **~2.5× throughput** on large libraries. See `retrieval.sh` for `CASCADE_FRAC`, `CASCADE_TIER_FRACS`, and `CASCADE_GATE_FOLDS`.
+- **Faster full-mode scoring:** score aggregation and ranking were rewritten for high throughput on large libraries, with scores that are nearly identical to the original path (bonus: lower memory utilization). Caching (when enabled) is now also done accross all folds simultaneously, cutting running time when generating the cache ~3-fold.
 
 **Full-mode fidelity: MAE **0.00403**, Pearson **0.99998**. Rankings are effectively interchangeable.
+
+## Running on AMD GPUs
+
+For running the DrugClip code on AMD GPUs (e.g. R9700, MI250X, MI300X) you can try the following conda setup:
+```
+conda create -n dsdd_drugclip python=3.10 -y
+conda activate dsdd_drugclip
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+pip install faiss-gpu
+pip install --no-cache-dir     iopath     lmdb     ml_collections     numpy     scipy     tensorboardX     tqdm     tokenizers h5py zstandard
+cwd=`pwd` && git clone https://github.com/dptech-corp/Uni-Core.git /tmp/Uni-core     && cd /tmp/Uni-core     && python setup.py install     && rm -rf /tmp/Uni-core && cd $cwd
+git clone https://github.com/DSDD-UCPH/DrugClip.git
+cd DrugClip/docker
+pip3 install --no-cache-dir -r requirements.txt 
+```
 
 ## Notes
 
