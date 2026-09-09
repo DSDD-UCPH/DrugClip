@@ -1,3 +1,14 @@
+"""Retired fp16 chunk-merge path. Do not use for the quantized shard index.
+
+This script stored shard provenance as torch.uint8 (`file_id`) and silently
+wrapped past 256 embedding files. The sequential 4-bit scan in
+``unimol/scan_index.py`` (then ``unimol/rerank_shortlist.py`` /
+``unimol/retrieve_index.py``) supersedes it.
+
+Kept only for reproducing old <256-file merges. Widen ``file_id`` to uint32
+only if this file must stay in production use — the scan path does not need
+it. Calling it with 256 or more input files now raises instead of wrapping.
+"""
 import os
 from screening_utils import VSmodel, PocketDataset, pocket_collate_fn
 import torch
@@ -70,6 +81,7 @@ def one_process(gpu_index, mol_model, pocket_reps_path, batch_size=4, gpu_num=8,
                 topk_index = topk_index[
                     torch.arange(topk_index.shape[0], device=device).reshape(-1, 1), ind
                 ]
+                # uint8 file_id wraps past 256 shards; this path is retired.
                 f_ind_m = torch.cat(
                     [f_ind_m.to(device), torch.ones_like(topk_score, dtype=torch.uint8) * file_id],
                     dim=1,
@@ -107,6 +119,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     embedding_list = args.mol_embs
+    if len(embedding_list) > 256:
+        raise RuntimeError(
+            "utils/screening_chunk.py is retired for >=256 shards: file_id is "
+            "torch.uint8 and would wrap. Use unimol/scan_index.py instead."
+        )
     gpu_num = args.gpu_num
     pocket_reps = args.pocket_reps
     batch_size = args.batch_size

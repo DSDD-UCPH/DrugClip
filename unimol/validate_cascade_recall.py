@@ -14,6 +14,10 @@ fold-0 top-`frac` gate for a few candidate fractions. Use this to choose a safe
 
 This script never writes molecule embedding caches and does not modify retrieval
 output; it only prints (and optionally saves) a small recall report.
+
+For production tightness (~1e-4 of the library, fold-4 gate vs 6-fold top-N
+inside top-10N) use ``unimol/validate_fold_gate.py`` instead. This diagnostic
+covers the looser cascade_frac=0.2 regime.
 """
 
 import argparse

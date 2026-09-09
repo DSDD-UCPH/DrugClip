@@ -31,6 +31,7 @@ from unimol.data.lmdb_dataset import (
     LMDBDataset as MolLMDBDataset,
     compact_lmdb_indices,
 )
+from unimol.packed_lmdb import open_mol_lmdb
 from unimol.tasks._drugclip_rank import (
     _SCORE_MEMMAP_SELECT_CHUNK,
     _pickle_score_chunk_size,
@@ -413,7 +414,10 @@ class DrugCLIP(UnicoreTask):
     def load_mols_dataset(self, data_path, atoms, coords, readahead=False, **kwargs):
         # Use the local LMDBDataset (fast open + optional readahead). Sequential
         # retrieval scans should pass readahead=True for HDD-friendly I/O.
-        dataset = MolLMDBDataset(data_path, readahead=readahead)
+        # Packed DCQP shards are auto-detected; pickle LMDBs keep the old path.
+        dataset = open_mol_lmdb(
+            data_path, dictionary=self.dictionary, readahead=readahead
+        )
         label_dataset = KeyDataset(dataset, "label", default=0)
         dataset = AffinityMolDataset(
             dataset,
@@ -767,7 +771,7 @@ class DrugCLIP(UnicoreTask):
         return resident
 
     def _close_mol_lmdb_envs(self, mol_dataset):
-        # Walk nested/Subset wrappers and close any MolLMDBDataset envs so the
+        # Walk nested/Subset wrappers and close any mol-LMDB envs so the
         # same path can be reopened (e.g. for opt-in late cascade compaction).
         seen = set()
         stack = [mol_dataset]
@@ -776,10 +780,15 @@ class DrugCLIP(UnicoreTask):
             if ds is None or id(ds) in seen:
                 continue
             seen.add(id(ds))
-            if isinstance(ds, MolLMDBDataset):
-                ds.close()
+            if isinstance(ds, MolLMDBDataset) or (
+                hasattr(ds, "db_path") and hasattr(ds, "close")
+            ):
+                try:
+                    ds.close()
+                except Exception:
+                    pass
                 continue
-            for attr in ("dataset", "datasets"):
+            for attr in ("dataset", "datasets", "base", "_inner"):
                 child = getattr(ds, attr, None)
                 if child is None:
                     continue

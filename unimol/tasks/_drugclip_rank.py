@@ -540,3 +540,65 @@ def _log_cascade_scratch(label, path):
         f"cascade scratch {label}: path={abspath} st_dev={dev}"
     )
     return abspath, dev
+
+
+class _RunningTopK:
+    """Streaming top-k over a 1-d metric. Keeps (metric, index) only.
+
+    Used by the quantized-index scan: one heap per target over the
+    max-over-pockets z-score, not per-pocket heaps and not score matrices.
+    """
+
+    def __init__(self, k):
+        self.k = max(1, int(k))
+        self.metrics = np.empty(0, dtype=np.float32)
+        self.indices = np.empty(0, dtype=np.int64)
+        self._buf_m = []
+        self._buf_i = []
+        self._buf_n = 0
+        self._flush_at = max(self.k * 2, 8192)
+
+    def add_batch(self, metrics, indices):
+        metrics = np.asarray(metrics, dtype=np.float32).reshape(-1)
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if metrics.size == 0:
+            return
+        if metrics.size != indices.size:
+            raise ValueError("metrics and indices must have the same length")
+        self._buf_m.append(metrics)
+        self._buf_i.append(indices)
+        self._buf_n += int(metrics.size)
+        if self._buf_n >= self._flush_at:
+            self._flush()
+
+    def _flush(self):
+        if self._buf_n == 0 and self.metrics.size == 0:
+            return
+        parts_m = [self.metrics] if self.metrics.size else []
+        parts_i = [self.indices] if self.indices.size else []
+        parts_m.extend(self._buf_m)
+        parts_i.extend(self._buf_i)
+        metrics = (
+            np.concatenate(parts_m, axis=0) if parts_m else np.empty(0, dtype=np.float32)
+        )
+        indices = (
+            np.concatenate(parts_i, axis=0) if parts_i else np.empty(0, dtype=np.int64)
+        )
+        self._buf_m.clear()
+        self._buf_i.clear()
+        self._buf_n = 0
+        n = int(metrics.size)
+        if n > self.k:
+            sel = np.argpartition(metrics, -self.k)[-self.k :]
+            metrics = metrics[sel]
+            indices = indices[sel]
+        self.metrics = metrics
+        self.indices = indices
+
+    def finalize(self):
+        self._flush()
+        if self.indices.size == 0:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+        order = np.argsort(self.metrics, kind="stable")[::-1]
+        return self.indices[order], self.metrics[order]
+
