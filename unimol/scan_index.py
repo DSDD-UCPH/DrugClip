@@ -43,12 +43,30 @@ def _target_stem(path):
     return os.path.splitext(os.path.basename(os.path.abspath(path)))[0]
 
 
-def _dequant_chunk_torch(codes_u8, codebook, device):
+def _dequant_chunk_torch(codes_u8, codebook, device, tq=None):
+    """Dequantize a codes chunk on ``device``.
+
+    Production default is 4-bit packed nibbles. Other bit widths use
+    ``TurboQuant`` packing metadata so ablation scans stay bit-correct.
+    """
     t = torch.from_numpy(np.ascontiguousarray(codes_u8)).to(device, non_blocking=True)
-    hi = torch.bitwise_right_shift(t, 4).to(torch.long)
-    lo = torch.bitwise_and(t, 0x0F).to(torch.long)
-    dim = int(t.shape[1]) * 2
-    idx = torch.stack((hi, lo), dim=-1).reshape(t.shape[0], dim)
+    bits = 4 if tq is None else int(tq.bits)
+    packed = True if tq is None else bool(tq.packed)
+    dim = int(tq.dim) if tq is not None else int(t.shape[1]) * 2
+    if bits == 4 and packed:
+        hi = torch.bitwise_right_shift(t, 4).to(torch.long)
+        lo = torch.bitwise_and(t, 0x0F).to(torch.long)
+        idx = torch.stack((hi, lo), dim=-1).reshape(t.shape[0], dim)
+        return codebook[idx]
+    if packed:
+        from unimol.turboquant import unpack_indices
+
+        idx_np = unpack_indices(np.ascontiguousarray(codes_u8), dim, bits)
+        idx = torch.from_numpy(np.ascontiguousarray(idx_np)).to(
+            device, dtype=torch.long, non_blocking=True
+        )
+        return codebook[idx]
+    idx = t.to(torch.long)
     return codebook[idx]
 
 
@@ -97,7 +115,7 @@ def scan_codes_for_targets(manifest, tq, targets, chunk_mols, use_cuda):
             end = min(n, start + int(chunk_mols))
             packed = np.ascontiguousarray(codes[start:end])
             if use_th:
-                y = _dequant_chunk_torch(packed, codebook, device)
+                y = _dequant_chunk_torch(packed, codebook, device, tq=tq)
                 local = np.arange(off + start, off + end, dtype=np.int64)
                 for t, q in zip(targets, q_rots):
                     scores = (q @ y.t()).detach().float().cpu().numpy()

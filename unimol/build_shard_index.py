@@ -86,8 +86,13 @@ def main(args):
         torch.cuda.set_device(args.device_id)
 
     tq = TurboQuant.load(args.turboquant_path)
-    if tq.dim != 128 or tq.bits != 4:
-        raise ValueError(f"unexpected turboquant {tq.metadata()}")
+    if tq.dim != 128:
+        raise ValueError(f"unexpected turboquant dim {tq.metadata()}")
+    if tq.bits != 4 and not getattr(args, "allow_nondefault_bits", False):
+        raise ValueError(
+            f"unexpected turboquant {tq.metadata()}; "
+            "pass --allow-nondefault-bits for publication ablations"
+        )
 
     src_lmdb = os.path.abspath(args.lmdb)
     out_dir = os.path.abspath(args.out_dir or os.path.dirname(src_lmdb) or ".")
@@ -186,6 +191,11 @@ def cli_main():
     parser.add_argument("--retrieval-bsz", type=int, default=256)
     parser.add_argument("--length-bucket", type=int, default=1)
     parser.add_argument("--delete-old", action="store_true")
+    parser.add_argument(
+        "--allow-nondefault-bits",
+        action="store_true",
+        help="permit TurboQuant codecs with bits!=4 (publication ablations only)",
+    )
     options.add_model_args(parser)
     args = options.parse_args_and_arch(parser)
     distributed_utils.call_main(args, main)

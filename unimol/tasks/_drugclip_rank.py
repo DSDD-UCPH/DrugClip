@@ -306,17 +306,22 @@ def _robust_pocket_anchors(scores):
         return medians, mads
 
     cpu = os.cpu_count() or 8
-    # Each worker copies ~1-2 full rows (partition + abs_dev). On large dense
+    # Each worker copies ~1-2 full rows (partition + abs_dev). On wide dense
     # pools (cascade final rank: 400 x ~1-2M) parallel copies thrash into
-    # multi-minute swap under post-encode memory pressure — use sequential.
+    # multi-minute swap — keep those sequential. A handful of pockets at
+    # library scale (DUD-E, rank-recovery) is only tens of MiB per worker and
+    # should thread: numpy partition releases the GIL.
     row_bytes = max(int(n_mols), 1) * 4
-    if n_mols > 500_000 or _cascade_score_bytes(n_pock, n_mols, np.float32) > (
+    wide = n_pock >= 64
+    if wide and n_mols > 500_000:
+        n_workers = 1
+    elif wide and _cascade_score_bytes(n_pock, n_mols, np.float32) > (
         2 * 1024 * 1024 * 1024
     ):
         n_workers = 1
     else:
-        # Keep concurrent row working sets under ~64 MiB (~3 buffers/worker).
-        max_by_mem = max(1, (64 * 1024 * 1024) // max(row_bytes * 3, 1))
+        budget = (2 * 1024 * 1024 * 1024) if not wide else (64 * 1024 * 1024)
+        max_by_mem = max(1, budget // max(row_bytes * 3, 1))
         n_workers = max(1, min(n_pock, cpu, max_by_mem))
 
     if n_workers == 1:

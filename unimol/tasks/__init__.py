@@ -1,7 +1,11 @@
 from pathlib import Path
 import importlib
 
-# automatically import any Python files in the criterions/ directory
+# Import task modules so @register_task side effects run. Skip __init__,
+# private modules (_*), and stray names like ".py" that would yield
+# "unimol.tasks." and crash importlib.
 for file in sorted(Path(__file__).parent.glob("*.py")):
-    if not file.name.startswith("_"):
-        importlib.import_module("unimol.tasks." + file.name[:-3])
+    stem = file.stem
+    if not stem or stem.startswith("_") or not stem.isidentifier():
+        continue
+    importlib.import_module("unimol.tasks." + stem)

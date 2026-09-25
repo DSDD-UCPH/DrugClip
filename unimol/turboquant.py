@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
@@ -345,7 +346,20 @@ def write_codes_chunked(path, embs, tq, chunk=65536):
     return path
 
 
-def dequant_gemm_numpy(query_orig, codes, tq, chunk_mols=1_048_576):
+def _ensure_score_out(out, n_q, n_mols):
+    n_q = int(n_q)
+    n_mols = int(n_mols)
+    if out is None:
+        return np.empty((n_q, n_mols), dtype=np.float32)
+    if tuple(out.shape) != (n_q, n_mols) or out.dtype != np.float32:
+        raise ValueError(
+            f"score out shape/dtype {getattr(out, 'shape', None)} {getattr(out, 'dtype', None)} "
+            f"!= ({n_q}, {n_mols}) float32"
+        )
+    return out
+
+
+def dequant_gemm_numpy(query_orig, codes, tq, chunk_mols=1_048_576, out=None):
     """Score (n_query, n_mols) = rotate(query) @ dequant(codes).T, chunked.
 
     query_orig: (Q, d) float32 original-frame embeddings (L2-normalized).
@@ -354,7 +368,7 @@ def dequant_gemm_numpy(query_orig, codes, tq, chunk_mols=1_048_576):
     q_rot = tq.rotate_query(np.ascontiguousarray(query_orig, dtype=np.float32))
     n_mols = int(codes.shape[0])
     n_q = int(q_rot.shape[0])
-    out = np.empty((n_q, n_mols), dtype=np.float32)
+    out = _ensure_score_out(out, n_q, n_mols)
     for start in range(0, n_mols, int(chunk_mols)):
         end = min(n_mols, start + int(chunk_mols))
         y = tq.dequantize(codes[start:end], packed=True)
@@ -362,43 +376,168 @@ def dequant_gemm_numpy(query_orig, codes, tq, chunk_mols=1_048_576):
     return out
 
 
-def dequant_gemm_torch(query_orig, codes, tq, chunk_mols=524288, device=None):
+def _writable_contiguous(arr, dtype=None):
+    """C-contiguous, writable view/copy. Memmaps are read-only; torch warns on those."""
+    out = np.ascontiguousarray(arr) if dtype is None else np.ascontiguousarray(arr, dtype=dtype)
+    if not out.flags.writeable:
+        out = out.copy()
+    return out
+
+
+def dequant_gemm_torch(query_orig, codes, tq, chunk_mols=524288, device=None, out=None):
     """GPU chunked GEMM. Returns a CPU float32 (Q, N) array.
 
-    Falls back to numpy if torch or CUDA is unavailable.
+    Falls back to numpy if torch or CUDA is unavailable. When ``out`` is set,
+    writes into that array. mmap→pin, async H2D, GEMM, and async D2H overlap
+    so a blocking ``.cpu().numpy()`` does not stall the GPU after every tile.
     """
     try:
         import torch
     except ImportError:
-        return dequant_gemm_numpy(query_orig, codes, tq, chunk_mols=chunk_mols)
+        return dequant_gemm_numpy(query_orig, codes, tq, chunk_mols=chunk_mols, out=out)
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    codebook = torch.from_numpy(np.ascontiguousarray(tq.codebook)).to(device)
-    rot = torch.from_numpy(np.ascontiguousarray(tq.rotation)).to(device)
-    q = torch.from_numpy(np.ascontiguousarray(query_orig, dtype=np.float32)).to(device)
+    if device.type != "cuda":
+        return dequant_gemm_numpy(query_orig, codes, tq, chunk_mols=chunk_mols, out=out)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    codebook = torch.from_numpy(_writable_contiguous(tq.codebook)).to(device)
+    rot = torch.from_numpy(_writable_contiguous(tq.rotation)).to(device)
+    q = torch.from_numpy(_writable_contiguous(query_orig, dtype=np.float32)).to(device)
     q_rot = q @ rot
     n_mols = int(codes.shape[0])
     n_q = int(q_rot.shape[0])
-    out = np.empty((n_q, n_mols), dtype=np.float32)
+    out = _ensure_score_out(out, n_q, n_mols)
     dim = tq.dim
     bits = int(tq.bits)
-    for start in range(0, n_mols, int(chunk_mols)):
-        end = min(n_mols, start + int(chunk_mols))
-        packed = np.array(codes[start:end], dtype=np.uint8, copy=True)
+    width = int(codes.shape[1]) if getattr(codes, "ndim", 1) > 1 else 1
+    max_chunk = max(1, min(int(chunk_mols), max(1, n_mols)))
+    chunks = [(s, min(n_mols, s + max_chunk)) for s in range(0, n_mols, max_chunk)]
+    if not chunks:
+        return out
+    copy_in = torch.cuda.Stream(device=device)
+    compute = torch.cuda.Stream(device=device)
+    copy_out = torch.cuda.Stream(device=device)
+    try:
+        pin_in = [
+            torch.empty((max_chunk, width), dtype=torch.uint8, pin_memory=True),
+            torch.empty((max_chunk, width), dtype=torch.uint8, pin_memory=True),
+        ]
+        pin_nt = [
+            torch.empty((max_chunk, n_q), dtype=torch.float32, pin_memory=True),
+            torch.empty((max_chunk, n_q), dtype=torch.float32, pin_memory=True),
+        ]
+        pinned = True
+    except Exception:
+        pin_in = pin_nt = None
+        pinned = False
+    gpu_codes = [
+        torch.empty((max_chunk, width), dtype=torch.uint8, device=device),
+        torch.empty((max_chunk, width), dtype=torch.uint8, device=device),
+    ]
+    gpu_nt = [
+        torch.empty((max_chunk, n_q), dtype=torch.float32, device=device),
+        torch.empty((max_chunk, n_q), dtype=torch.float32, device=device),
+    ]
+    ev_h2d = [torch.cuda.Event(), torch.cuda.Event()]
+    ev_d2h = [torch.cuda.Event(), torch.cuda.Event()]
+    packed_hold = [None, None]
+
+    def _fill(buf, start, end):
+        n = end - start
+        if pinned:
+            dest = pin_in[buf][:n].numpy()
+            src = codes[start:end]
+            if src.dtype != np.uint8 or not getattr(src, "flags", None) or not src.flags.c_contiguous:
+                src = np.ascontiguousarray(src, dtype=np.uint8)
+            if src.ndim == 1:
+                src = src.reshape(n, width)
+            np.copyto(dest, src, casting="unsafe")
+            return
+        packed_hold[buf] = np.array(codes[start:end], dtype=np.uint8, copy=True)
+
+    def _h2d(buf, n):
+        if pinned:
+            with torch.cuda.stream(copy_in):
+                gpu_codes[buf][:n].copy_(pin_in[buf][:n], non_blocking=True)
+                ev_h2d[buf].record(copy_in)
+            return
+        packed = packed_hold[buf]
+        src = torch.from_numpy(packed.reshape(n, -1) if packed.ndim == 1 else packed)
+        if src.ndim == 1:
+            src = src.view(n, width)
+        gpu_codes[buf][:n].copy_(src)
+        ev_h2d[buf].record()
+
+    def _codes_t(buf, n):
+        t = gpu_codes[buf][:n]
         if bits == 4:
-            t = torch.from_numpy(packed).to(device, non_blocking=True)
             hi = torch.bitwise_right_shift(t, 4).to(torch.long)
             lo = torch.bitwise_and(t, 0x0F).to(torch.long)
-            idx = torch.stack((hi, lo), dim=-1).reshape(t.shape[0], dim)
+            return torch.stack((hi, lo), dim=-1).reshape(n, dim)
+        idx_np = unpack_indices(t[:n].detach().cpu().numpy(), dim, bits)
+        return torch.from_numpy(_writable_contiguous(idx_np)).to(
+            device, dtype=torch.long
+        )
+
+    def _gemm_d2h(buf, n):
+        compute.wait_event(ev_h2d[buf])
+        with torch.cuda.stream(compute):
+            idx = _codes_t(buf, n)
+            y = codebook[idx]
+            torch.mm(y, q_rot.T, out=gpu_nt[buf][:n])
+        if pinned:
+            with torch.cuda.stream(copy_out):
+                copy_out.wait_stream(compute)
+                pin_nt[buf][:n].copy_(gpu_nt[buf][:n], non_blocking=True)
+                ev_d2h[buf].record(copy_out)
         else:
-            idx_np = unpack_indices(packed, dim, bits)
-            idx = torch.from_numpy(np.ascontiguousarray(idx_np)).to(
-                device, dtype=torch.long, non_blocking=True
-            )
-        y = codebook[idx]  # (B, dim)
-        block = q_rot @ y.t()
-        out[:, start:end] = block.detach().float().cpu().numpy()
+            compute.synchronize()
+
+    def _harvest(buf, start, end):
+        n = end - start
+        if pinned:
+            ev_d2h[buf].synchronize()
+            np.copyto(out[:, start:end], pin_nt[buf][:n].numpy().T)
+            return
+        np.copyto(out[:, start:end], gpu_nt[buf][:n].detach().float().cpu().numpy().T)
+
+    def _run(pool):
+        _fill(0, chunks[0][0], chunks[0][1])
+        _h2d(0, chunks[0][1] - chunks[0][0])
+        fill_fut = None
+        if pinned and len(chunks) > 1:
+            fill_fut = pool.submit(_fill, 1, chunks[1][0], chunks[1][1])
+        elif len(chunks) > 1:
+            _fill(1, chunks[1][0], chunks[1][1])
+        for ci, (start, end) in enumerate(chunks):
+            buf = ci % 2
+            nxt = (ci + 1) % 2
+            _gemm_d2h(buf, end - start)
+            if ci + 1 < len(chunks):
+                if fill_fut is not None:
+                    fill_fut.result()
+                    fill_fut = None
+                _h2d(nxt, chunks[ci + 1][1] - chunks[ci + 1][0])
+            if ci + 2 < len(chunks):
+                ev_h2d[buf].synchronize()
+                ns, ne = chunks[ci + 2]
+                if pinned:
+                    fill_fut = pool.submit(_fill, buf, ns, ne)
+                else:
+                    _fill(buf, ns, ne)
+            if ci >= 1:
+                ps, pe = chunks[ci - 1]
+                _harvest((ci - 1) % 2, ps, pe)
+        _harvest((len(chunks) - 1) % 2, chunks[-1][0], chunks[-1][1])
+
+    if pinned:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            _run(pool)
+    else:
+        _run(None)
     return out
 
 
