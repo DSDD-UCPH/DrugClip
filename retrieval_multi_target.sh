@@ -23,9 +23,11 @@ FOLD_VERSION="${FOLD_VERSION:-6_folds}"
 use_cache="${use_cache:-True}"
 
 # Retrieval mode:
-#   full    - encode every fold over the whole library (default)
+#   full    - encode SCREEN_FOLDS (default 1,4,5) over the whole library
 #   cascade - multi-tier gating then full-fold rescore on survivors
 RETRIEVAL_MODE="${RETRIEVAL_MODE:-full}"
+SCREEN_FOLDS="${SCREEN_FOLDS:-1,4,5}"
+STORE_ALL="${STORE_ALL:-False}"
 CASCADE_FRAC="${CASCADE_FRAC:-0.2}"
 CASCADE_TIER_FRACS="${CASCADE_TIER_FRACS:-1.0,0.5,0.25}"
 CASCADE_GATE_FOLDS="${CASCADE_GATE_FOLDS:-4,1}"
@@ -124,6 +126,8 @@ for POCKET_PATH in "${POCKET_LMDBS[@]}"; do
        --fold-version "$FOLD_VERSION" \
        --use-cache "$use_cache" \
        --retrieval-mode "$RETRIEVAL_MODE" \
+       --screen-folds "$SCREEN_FOLDS" \
+       --store-all "$STORE_ALL" \
        --cascade-frac "$CASCADE_FRAC" \
        --cascade-tier-fracs "$CASCADE_TIER_FRACS" \
        --cascade-gate-folds "$CASCADE_GATE_FOLDS" \

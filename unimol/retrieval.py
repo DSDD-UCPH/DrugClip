@@ -74,7 +74,7 @@ def main(args):
 
     retrieval_bsz = args.retrieval_bsz if args.retrieval_bsz and args.retrieval_bsz > 0 else None
 
-    task.retrieval_multi_folds(model, args.pocket_path, args.save_path, args.mol_path, fold_version=args.fold_version, use_cache=args.use_cache, use_cuda=use_cuda, retrieval_mode=args.retrieval_mode, cascade_frac=args.cascade_frac, cascade_tier_fracs=args.cascade_tier_fracs, cascade_gate_folds=args.cascade_gate_folds, write_cache=args.write_cache, retrieval_bsz=retrieval_bsz)
+    task.retrieval_multi_folds(model, args.pocket_path, args.save_path, args.mol_path, fold_version=args.fold_version, use_cache=args.use_cache, use_cuda=use_cuda, retrieval_mode=args.retrieval_mode, cascade_frac=args.cascade_frac, cascade_tier_fracs=args.cascade_tier_fracs, cascade_gate_folds=args.cascade_gate_folds, write_cache=args.write_cache, retrieval_bsz=retrieval_bsz, screen_folds=args.screen_folds, store_all=args.store_all)
 
 
 def cli_main():
@@ -101,10 +101,12 @@ def cli_main():
         return [int(x) for x in str(v).split(",") if x.strip() != ""]
 
     parser.add_argument("--use-cache", type=str2bool, default=False, help="if True, reuse a complete mol embedding cache (fold*.npy or legacy fold*.pkl) or write float16 npy during the fused score pass; if False, fused score only and ignore mol caches")
-    parser.add_argument("--retrieval-mode", type=str, default="full", choices=["full", "cascade"], help="full: encode every fold over the whole library; cascade: configurable multi-tier gating that scores one fold per tier to progressively narrow the pool, then re-scores the surviving pool through all folds and ranks with the same procedure as full mode")
+    parser.add_argument("--retrieval-mode", type=str, default="full", choices=["full", "cascade"], help="full: encode --screen-folds (default 1,4,5) over the whole library, rank with native fold-mean scores, and store 2-bit codes; cascade: configurable multi-tier gating that scores one fold per tier to progressively narrow the pool, then re-scores the surviving pool through all folds")
     parser.add_argument("--cascade-frac", type=float, default=0.2, help="tier-1 fraction of the library kept after the first gate in cascade mode; each tier's kept fraction is this value times the matching --cascade-tier-fracs multiplier")
     parser.add_argument("--cascade-tier-fracs", type=float_list, default=[1.0, 0.5, 0.25], help="comma-separated multipliers of --cascade-frac, one per gating tier (e.g. 1.0,0.5,0.25); the number of entries sets how many single-fold gating tiers run before the full-fold rescore")
     parser.add_argument("--cascade-gate-folds", type=int_list, default=[4, 1], help="comma-separated fold index used by each gating tier (e.g. 4,1); shorter than --cascade-tier-fracs is padded with the remaining unused folds in ascending order")
+    parser.add_argument("--screen-folds", type=int_list, default=[1, 4, 5], help="comma-separated 0-based fold indices used by full-mode screening (default 1,4,5). Ignored in cascade mode.")
+    parser.add_argument("--store-all", type=str2bool, default=False, help="if True, full mode also writes <save-path>.all_scores.npy with the native score of every molecule; the top-100000 text file is still written")
     parser.add_argument("--write-cache", type=str2bool, default=True, help="persist pocket embeddings to disk (both modes). Score memmaps are always deleted after ranking. Does not gate mol caches.")
     parser.add_argument("--retrieval-bsz", type=int, default=0, help="DataLoader batch size for molecule encoding/scoring; 0 uses the internal default (384 for full mode, 64 for cascade)")
     parser.add_argument("--prefetch-factor", type=int, default=4, help="DataLoader prefetch_factor when num_workers > 0 (default 4)")

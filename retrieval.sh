@@ -8,6 +8,10 @@
 # use_cache=False: ignore mol caches. One fused score pass only; do not read or
 # write fold* mol files. MOL_PATH must be an LMDB screening library.
 #
+# Full mode scores SCREEN_FOLDS (default 1,4,5) and writes 2-bit TurboQuant
+# codes under ./data/encoded_mol_embs/<fold_version>/tq2/<mol_tag>/.
+# The 2-bit codec (rotation + codebook) is shared at
+# ./data/encoded_mol_embs/<fold_version>/tq2/turboquant.npz.
 # WRITE_CACHE persists pocket embeddings only. Score memmaps are always deleted
 # after ranking (scratch only).
 ###
@@ -22,7 +26,10 @@ use_cache=False
 save_path="Scoring_output.txt"
 
 # Retrieval mode:
-#   full    - encode every fold over the whole library (default, original behavior)
+#   full    - encode --screen-folds (default 1,4,5) over the whole library,
+#             rank with native fold-mean scores, and store 2-bit TurboQuant
+#             codes for those folds. Writes the top 100000 hits unless
+#             STORE_ALL=True, which also dumps every native score.
 #   cascade - two-phase screening for the use_cache=False / on-the-fly case:
 #             1) run CASCADE_TIER_FRACS single-fold gating tiers (one fold each,
 #                folds taken from CASCADE_GATE_FOLDS) to progressively narrow the
@@ -30,6 +37,11 @@ save_path="Scoring_output.txt"
 #             2) re-score the surviving pool through ALL folds and rank with the
 #                same procedure as full mode.
 RETRIEVAL_MODE=full
+
+# Full-mode fold set (0-based). Ignored when RETRIEVAL_MODE=cascade.
+SCREEN_FOLDS=1,4,5
+# If True, also write ${save_path}.all_scores.npy (every molecule, native scores).
+STORE_ALL=False
 
 # Cascading parameters
 CASCADE_FRAC=0.2
@@ -85,6 +97,8 @@ python ./unimol/retrieval.py --user-dir ./unimol $data_path "./dict" --valid-sub
        --fold-version $FOLD_VERSION \
        --use-cache $use_cache \
        --retrieval-mode $RETRIEVAL_MODE \
+       --screen-folds $SCREEN_FOLDS \
+       --store-all $STORE_ALL \
        --cascade-frac $CASCADE_FRAC \
        --cascade-tier-fracs $CASCADE_TIER_FRACS \
        --cascade-gate-folds $CASCADE_GATE_FOLDS \

@@ -32,6 +32,18 @@ from unimol.data.lmdb_dataset import (
     compact_lmdb_indices,
 )
 from unimol.packed_lmdb import open_mol_lmdb
+from unimol.full_screen import (
+    FULL_SCREEN_TOPK,
+    TQ2_BITS,
+    TQ2_SEED,
+    _resolve_screen_folds,
+    _screen_folds_tag,
+    _full_screen_k,
+    _tq2_codec_path,
+    _tq2_paths,
+    _write_names_npz,
+    _tq2_complete,
+)
 from unimol.tasks._drugclip_rank import (
     _SCORE_MEMMAP_SELECT_CHUNK,
     _pickle_score_chunk_size,
@@ -61,17 +73,13 @@ import h5py
 
 logger = logging.getLogger(__name__)
 
-# Fraction of the molecule library written to retrieval output (full, cascade, and
-# cascade recall diagnostics). Change this single value to adjust the top-k cut.
+# Fraction of the molecule library written by cascade (and cascade recall
+# diagnostics). Full mode writes a fixed top-100000 native-score shortlist.
 RETRIEVAL_TOP_FRAC = 0.01
 
 # Default DataLoader batch sizes when --retrieval-bsz is 0 / unset.
 _DEFAULT_RETRIEVAL_BSZ_FULL = 384
 _DEFAULT_RETRIEVAL_BSZ_CASCADE = 256
-
-# Suffix for on-disk mol lib_cache dirs. Embeddings follow LMDB order as
-# provided. Bump when the cache layout changes.
-_MOL_LIB_CACHE_VERSION = "lmdbsort"
 
 # Weight / pickle layout for ensemble fold_version strings.
 _FOLD_VERSION_SPECS = {
@@ -176,28 +184,39 @@ class DrugCLIP(UnicoreTask):
         }
 
     @classmethod
-    def _mol_cache_ready(cls, fold_version):
+    def _mol_cache_ready(cls, fold_version, folds=None):
         npy = cls._mol_npy_cache_paths(fold_version)
         pkl = cls._mol_pkl_cache_paths(fold_version)
-        npy_ready = all(os.path.exists(p) for p in npy["folds"]) and os.path.exists(
-            npy["names"]
+        fold_ids = (
+            list(range(cls._n_folds_for(fold_version)))
+            if folds is None
+            else [int(f) for f in folds]
         )
-        pkl_ready = all(os.path.exists(p) for p in pkl)
+        npy_ready = os.path.exists(npy["names"]) and all(
+            os.path.exists(npy["folds"][i]) for i in fold_ids
+        )
+        pkl_ready = all(os.path.exists(pkl[i]) for i in fold_ids)
         return npy_ready, pkl_ready
 
-    def _load_mol_fold_cache(self, fold_version):
-        """Load complete mol embedding cache: npy mmap preferred, else pickle.
+    def _load_mol_fold_cache(self, fold_version, folds=None):
+        """Load mol embedding cache: npy mmap preferred, else pickle.
 
+        When `folds` is set, only those fold files are required and returned.
         Returns (reps_by_fold, names, kind) where kind is "npy" or "pkl".
         """
-        npy_ready, pkl_ready = self._mol_cache_ready(fold_version)
+        fold_ids = (
+            list(range(self._n_folds_for(fold_version)))
+            if folds is None
+            else [int(f) for f in folds]
+        )
+        npy_ready, pkl_ready = self._mol_cache_ready(fold_version, folds=fold_ids)
         if npy_ready:
             npy = self._mol_npy_cache_paths(fold_version)
             reps = {
-                i: np.load(path, mmap_mode="r")
-                for i, path in enumerate(npy["folds"])
+                i: np.load(npy["folds"][i], mmap_mode="r")
+                for i in fold_ids
             }
-            n_mols = int(reps[0].shape[0])
+            n_mols = int(next(iter(reps.values())).shape[0])
             if not os.path.exists(npy["names"]):
                 raise RuntimeError(
                     f"mol npy cache missing names sidecar: {npy['names']}"
@@ -209,28 +228,29 @@ class DrugCLIP(UnicoreTask):
                 )
             logger.info(
                 f"loaded mol npy cache from {npy['dir']} "
-                f"({len(reps)} fold(s), n={n_mols}, dtype={reps[0].dtype})"
+                f"({len(reps)} fold(s) {fold_ids}, n={n_mols}, "
+                f"dtype={next(iter(reps.values())).dtype})"
             )
             return reps, names, "npy"
         if pkl_ready:
             pkl_paths = self._mol_pkl_cache_paths(fold_version)
             reps = {}
             names = None
-            for i, path in enumerate(pkl_paths):
-                with open(path, "rb") as f:
+            for i in fold_ids:
+                with open(pkl_paths[i], "rb") as f:
                     fold_reps, fold_names = pickle.load(f)
                 reps[i] = fold_reps
                 names = fold_names
             names = list(names)
             logger.info(
                 f"loaded mol pickle cache from {os.path.dirname(pkl_paths[0])} "
-                f"({len(reps)} fold(s), n={len(names)})"
+                f"({len(reps)} fold(s) {fold_ids}, n={len(names)})"
             )
             return reps, names, "pkl"
         npy = self._mol_npy_cache_paths(fold_version)
         raise FileNotFoundError(
             f"incomplete mol cache under {npy['dir']} "
-            f"(need all fold{{i}}.npy or all fold{{i}}.pkl)"
+            f"(need fold{{i}}.npy or fold{{i}}.pkl for folds {fold_ids})"
         )
 
     def _mol_graph_from_apo(self, apo_dataset):
@@ -733,7 +753,7 @@ class DrugCLIP(UnicoreTask):
         return f"{base}_{digest}"
 
     def _mol_library_cache_tag(self, mol_data_path):
-        return f"{self._input_file_cache_tag(mol_data_path)}_{_MOL_LIB_CACHE_VERSION}"
+        return self._input_file_cache_tag(mol_data_path)
 
     def _pocket_cache_dir(self, fold_version, pocket_path):
         pocket_tag = self._input_file_cache_tag(pocket_path)
@@ -833,27 +853,35 @@ class DrugCLIP(UnicoreTask):
         return reps
 
     def _cache_pocket_reps_by_fold(
-        self, model, ckpts, pocket_data, pocket_path, fold_version, use_cuda, write_cache=True
+        self, model, ckpts, pocket_data, pocket_path, fold_version, use_cuda, write_cache=True, folds=None
     ):
         # Load per-fold pocket embeddings from disk when available; otherwise
         # encode once per fold and optionally persist them. Cache paths are keyed
-        # by fold_version and the pocket LMDB path/size/mtime.
-        n_folds = len(ckpts)
+        # by fold_version and the pocket LMDB path/size/mtime. `folds` selects
+        # real fold indices (checkpoint / fold{i}.pkl ids); default is all ckpts.
+        fold_ids = (
+            list(range(len(ckpts)))
+            if folds is None
+            else [int(f) for f in folds]
+        )
         cache_dir = self._pocket_cache_dir(fold_version, pocket_path)
-        cache_paths = [os.path.join(cache_dir, f"fold{i}.pkl") for i in range(n_folds)]
+        cache_paths = {
+            fold: os.path.join(cache_dir, f"fold{fold}.pkl") for fold in fold_ids
+        }
 
         pocket_reps_by_fold = {}
         folds_to_encode = []
-        for fold, cache_path in enumerate(cache_paths):
+        for fold, cache_path in cache_paths.items():
             if os.path.exists(cache_path):
                 with open(cache_path, "rb") as f:
                     pocket_reps_by_fold[fold] = pickle.load(f)
             else:
                 folds_to_encode.append(fold)
 
+        n_folds = len(fold_ids)
         if not folds_to_encode:
             logger.info(
-                f"loaded pocket embeddings from {cache_dir} ({n_folds} fold(s))"
+                f"loaded pocket embeddings from {cache_dir} ({n_folds} fold(s) {fold_ids})"
             )
             return pocket_reps_by_fold
 
@@ -865,7 +893,7 @@ class DrugCLIP(UnicoreTask):
             )
         else:
             logger.info(
-                f"no pocket cache at {cache_dir}; encoding {n_folds} fold(s)"
+                f"no pocket cache at {cache_dir}; encoding fold(s) {folds_to_encode}"
             )
 
         for fold in folds_to_encode:
@@ -1113,16 +1141,20 @@ class DrugCLIP(UnicoreTask):
         )
         return scores_by_fold, names_acc
 
-    def _score_memmap_cache_dir(self, fold_version, mol_data_path, pocket_path):
+    def _score_memmap_cache_dir(self, fold_version, mol_data_path, pocket_path, screen_folds=None):
         # Scratch/cache dir for the fold-mean score memmap used by streaming full
         # mode. Keyed by fold_version + mol library tag + pocket tag so distinct
-        # inputs never collide.
+        # inputs never collide. `screen_folds` is included so a 6-fold memmap
+        # cannot be reused for a 3-fold screen.
         mol_tag = self._mol_library_cache_tag(mol_data_path)
         pocket_tag = self._input_file_cache_tag(pocket_path)
+        parts = [mol_tag, pocket_tag]
+        if screen_folds is not None:
+            parts.append(_screen_folds_tag(screen_folds))
         return os.path.join(
             f"./data/encoded_mol_embs/{fold_version}",
             "score_memmap",
-            f"{mol_tag}__{pocket_tag}",
+            "__".join(parts),
         )
 
     def _score_memmap_paths(self, cache_dir):
@@ -1239,12 +1271,16 @@ class DrugCLIP(UnicoreTask):
         flush_interval=50,
         write_mol_cache=False,
         fold_version=None,
+        write_tq2=False,
+        tq=None,
+        tq2_paths=None,
     ):
         # Stream the molecule library through all resident fold encoders in one
         # DataLoader pass. Per batch, compute the fold-mean pocket@mol score on
         # GPU and write columns into the on-disk memmap. Never materializes
         # (n_mols x emb_dim) embeddings or a full (n_pockets x n_mols) host array.
-        # When write_mol_cache, also stream float16 fold{i}.npy memmaps.
+        # When write_mol_cache, also stream float16 fold{i}.npy memmaps for the
+        # encoded folds only. When write_tq2, stream packed 2-bit codes.
         n_mols = len(mol_dataset)
         n_pockets = memmap.shape[0]
         dtype = memmap.dtype
@@ -1304,15 +1340,25 @@ class DrugCLIP(UnicoreTask):
         remaining = n_mols - n_written
         n_iters = (remaining + bsz - 1) // bsz
         label_suffix = f" ({run_label})" if run_label else ""
+        extra = []
+        if write_mol_cache:
+            extra.append("writing mol npy cache")
+        if write_tq2:
+            extra.append("writing 2-bit codes")
+        extra_s = f", {', '.join(extra)}" if extra else ""
         logger.info(
             f"fused fold-mean scoring{label_suffix}: iterations={n_iters}, "
-            f"folds={n_folds}, batch_size={bsz}, "
-            f"molecules={remaining} (resume_from={n_written})"
-            f"{', writing mol npy cache' if write_mol_cache else ''}"
+            f"folds={sorted(fold_encoders)}, batch_size={bsz}, "
+            f"molecules={remaining} (resume_from={n_written}){extra_s}"
         )
+        if write_tq2:
+            if tq is None or tq2_paths is None:
+                raise ValueError("write_tq2 requires tq and tq2_paths")
+            os.makedirs(tq2_paths["dir"], exist_ok=True)
         offset = n_written
         emb_mms = None
         npy_paths = None
+        tq2_mms = None
         if use_cuda:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1337,24 +1383,47 @@ class DrugCLIP(UnicoreTask):
                             # look like a complete cache (folds + stale names).
                             if os.path.exists(npy_paths["names"]):
                                 os.remove(npy_paths["names"])
-                            emb_mms = []
-                            for path in npy_paths["folds"]:
-                                emb_mms.append(
-                                    np.lib.format.open_memmap(
-                                        path,
-                                        mode="w+",
-                                        dtype=np.float16,
-                                        shape=(n_mols, emb_dim),
-                                    )
+                            emb_mms = {}
+                            for enc_fold in fold_encoders:
+                                path = npy_paths["folds"][int(enc_fold)]
+                                emb_mms[int(enc_fold)] = np.lib.format.open_memmap(
+                                    path,
+                                    mode="w+",
+                                    dtype=np.float16,
+                                    shape=(n_mols, emb_dim),
                                 )
                             logger.info(
                                 f"writing mol npy cache under {npy_paths['dir']} "
+                                f"folds={sorted(emb_mms)} "
                                 f"(shape=({n_mols}, {emb_dim}), dtype=float16)"
                             )
                         emb_mms[int(fold)][offset:offset + batch_len] = (
                             emb.detach().to(torch.float16).cpu().numpy()
                         )
                     emb_f = emb.float()
+                    if write_tq2:
+                        if tq2_mms is None:
+                            os.makedirs(tq2_paths["dir"], exist_ok=True)
+                            tq2_mms = {}
+                            for enc_fold in fold_encoders:
+                                code_path = tq2_paths["codes"][int(enc_fold)]
+                                parent = os.path.dirname(code_path)
+                                if parent:
+                                    os.makedirs(parent, exist_ok=True)
+                                tq2_mms[int(enc_fold)] = np.lib.format.open_memmap(
+                                    code_path,
+                                    mode="w+",
+                                    dtype=np.uint8,
+                                    shape=(n_mols, int(tq.code_width)),
+                                )
+                            logger.info(
+                                f"writing 2-bit codes under {tq2_paths['dir']} "
+                                f"folds={sorted(tq2_mms)} "
+                                f"(shape=({n_mols}, {tq.code_width}))"
+                            )
+                        tq2_mms[int(fold)][offset:offset + batch_len] = tq.quantize(
+                            emb_f.detach().cpu().numpy()
+                        )
                     score = pocket_t_by_fold[fold] @ emb_f.t()
                     if mean_score is None:
                         mean_score = score
@@ -1371,7 +1440,10 @@ class DrugCLIP(UnicoreTask):
                         paths, n_pockets, n_mols, offset, dtype
                     )
                     if emb_mms is not None:
-                        for mm in emb_mms:
+                        for mm in emb_mms.values():
+                            mm.flush()
+                    if tq2_mms is not None:
+                        for mm in tq2_mms.values():
                             mm.flush()
         if use_cuda:
             torch.cuda.synchronize()
@@ -1379,13 +1451,21 @@ class DrugCLIP(UnicoreTask):
         self._flush_score_memmap_meta(paths, n_pockets, n_mols, offset, dtype)
         self._write_names_sidecar(paths, names_acc)
         if emb_mms is not None:
-            for mm in emb_mms:
+            for mm in emb_mms.values():
                 mm.flush()
             np.save(npy_paths["names"], np.asarray(names_acc, dtype=object))
             logger.info(
                 f"wrote mol npy cache names ({len(names_acc)}) to {npy_paths['names']}"
             )
             del emb_mms
+        if tq2_mms is not None:
+            for mm in tq2_mms.values():
+                mm.flush()
+            _write_names_npz(tq2_paths["names"], names_acc)
+            logger.info(
+                f"wrote 2-bit code names ({len(names_acc)}) to {tq2_paths['names']}"
+            )
+            del tq2_mms
         elapsed = time.perf_counter() - t0
         mols_per_sec = remaining / elapsed if elapsed > 0 else 0.0
         logger.info(
@@ -1486,12 +1566,13 @@ class DrugCLIP(UnicoreTask):
         )
 
     def _select_topk_from_score_memmap(
-        self, memmap, fold_version, names, save_path, chunk_size=None
+        self, memmap, fold_version, names, save_path, chunk_size=None, k=None, store_all=False
     ):
         # Exact per-pocket median/MAD from contiguous memmap rows, then
         # molecule-chunked z-score + max-over-pockets into a (n_mols,) vector,
         # then argpartition top-k. Matches `_ensemble_rank_mols` numerically
-        # (aside from on-disk score dtype quantization).
+        # (aside from on-disk score dtype quantization). Ranking always uses
+        # this native metric, never dequantized TurboQuant scores.
         if chunk_size is None:
             chunk_size = _SCORE_MEMMAP_SELECT_CHUNK
         n_pockets, n_mols = memmap.shape
@@ -1520,7 +1601,12 @@ class DrugCLIP(UnicoreTask):
                 block = np.asarray(memmap[:, start:end], dtype=np.float32)
                 res_max[start:end] = np.max(block, axis=0)
 
-        k = max(1, int(n_mols * RETRIEVAL_TOP_FRAC))
+        if k is None:
+            k = max(1, int(n_mols * RETRIEVAL_TOP_FRAC))
+            frac_note = f" ({RETRIEVAL_TOP_FRAC:.2%})"
+        else:
+            k = _full_screen_k(n_mols, k)
+            frac_note = ""
         if k > 0:
             top_idx = np.argpartition(res_max, -k)[-k:]
             top_idx = top_idx[np.argsort(res_max[top_idx])[::-1]]
@@ -1531,8 +1617,19 @@ class DrugCLIP(UnicoreTask):
             for i in top_idx:
                 f.write(f"{names[i]},{res_max[i]}\n")
         logger.info(
-            f"wrote top {k}/{n_mols} ({RETRIEVAL_TOP_FRAC:.2%}) results to {save_path}"
+            f"wrote top {k}/{n_mols}{frac_note} native scores to {save_path}"
         )
+        if store_all:
+            all_path = f"{save_path}.all_scores.npy"
+            tmp = all_path + ".tmp.npy"
+            parent = os.path.dirname(os.path.abspath(all_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            np.save(tmp, np.ascontiguousarray(res_max, dtype=np.float32))
+            os.replace(tmp, all_path)
+            logger.info(
+                f"wrote all {n_mols} native scores to {all_path}"
+            )
         return res_max, top_idx
 
     def benchmark_mol_encoding(
@@ -1686,7 +1783,204 @@ class DrugCLIP(UnicoreTask):
             )
         return results
 
-    def retrieval_multi_folds(self, model, pocket_path, save_path, mol_data_path, fold_version, use_cache=True, use_cuda=True, retrieval_mode="full", cascade_frac=0.2, cascade_tier_fracs=None, cascade_gate_folds=None, write_cache=True, retrieval_bsz=None, **kwargs):
+    def _load_or_create_tq2(self, codec_path, dim=128):
+        from unimol.turboquant import TurboQuant
+
+        dim = int(dim)
+        if os.path.isfile(codec_path):
+            tq = TurboQuant.load(codec_path)
+            if tq.bits != TQ2_BITS:
+                raise ValueError(
+                    f"expected {TQ2_BITS}-bit turboquant at {codec_path}, "
+                    f"got bits={tq.bits}"
+                )
+            if tq.dim != dim:
+                raise ValueError(
+                    f"turboquant dim {tq.dim} != embedding dim {dim} at {codec_path}"
+                )
+            return tq
+        parent = os.path.dirname(os.path.abspath(codec_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tq = TurboQuant.create(dim=dim, bits=TQ2_BITS, seed=TQ2_SEED)
+        tq.save(codec_path)
+        logger.info(
+            f"wrote {TQ2_BITS}-bit turboquant codec {codec_path} "
+            f"dim={dim} version={tq.version}"
+        )
+        return tq
+
+    def _stream_tq2_codes(
+        self,
+        fold_encoders,
+        mol_dataset,
+        use_cuda,
+        bsz,
+        tq,
+        tq2_paths,
+        names=None,
+        flush_interval=50,
+        run_label="tq2 codes",
+    ):
+        # Encode the library through `fold_encoders` and pack 2-bit codes.
+        # Embeddings are discarded batch by batch.
+        n_mols = len(mol_dataset)
+        collate_fn = self._resolve_collater(mol_dataset)
+        mol_data_loader = torch.utils.data.DataLoader(
+            mol_dataset,
+            batch_size=bsz,
+            collate_fn=collate_fn,
+            **self._mol_dataloader_kwargs(use_cuda),
+        )
+        os.makedirs(tq2_paths["dir"], exist_ok=True)
+        tq2_mms = {}
+        for fold in fold_encoders:
+            code_path = tq2_paths["codes"][int(fold)]
+            parent = os.path.dirname(code_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tq2_mms[int(fold)] = np.lib.format.open_memmap(
+                code_path,
+                mode="w+",
+                dtype=np.uint8,
+                shape=(n_mols, int(tq.code_width)),
+            )
+        logger.info(
+            f"encoding 2-bit codes{f' ({run_label})' if run_label else ''}: "
+            f"folds={sorted(fold_encoders)}, molecules={n_mols}, "
+            f"batch_size={bsz}"
+        )
+        collect_names = names is None
+        names_acc = [] if collect_names else None
+        offset = 0
+        try:
+            with torch.inference_mode():
+                for batch_idx, sample in enumerate(tqdm(mol_data_loader)):
+                    if use_cuda:
+                        sample = unicore.utils.move_to_cuda(sample)
+                    batch_len = None
+                    for fold, (fold_mol_model, fold_mol_project) in fold_encoders.items():
+                        emb = self._encode_mol_batch_tensor(
+                            fold_mol_model, fold_mol_project, sample
+                        )
+                        if batch_len is None:
+                            batch_len = int(emb.shape[0])
+                        tq2_mms[int(fold)][offset:offset + batch_len] = tq.quantize(
+                            emb.float().detach().cpu().numpy()
+                        )
+                    if collect_names:
+                        names_acc.extend(sample["smi_name"])
+                    offset += batch_len
+                    if batch_idx % flush_interval == 0:
+                        for mm in tq2_mms.values():
+                            mm.flush()
+        finally:
+            self._shutdown_dataloader(mol_data_loader)
+            for mm in tq2_mms.values():
+                mm.flush()
+            del tq2_mms
+        if offset != n_mols:
+            raise RuntimeError(
+                f"2-bit code pass wrote {offset} rows, expected {n_mols}"
+            )
+        if collect_names:
+            names = names_acc
+        _write_names_npz(tq2_paths["names"], names)
+        logger.info(
+            f"wrote 2-bit codes for folds {sorted(fold_encoders)} "
+            f"({n_mols} mols) under {tq2_paths['dir']}"
+        )
+        return names
+
+    def _ensure_tq2_codes(
+        self,
+        tq2_paths,
+        tq,
+        screen_folds,
+        n_mols,
+        names,
+        mol_reps_by_fold=None,
+        fold_version=None,
+        mol_dataset=None,
+        fold_encoders=None,
+        model=None,
+        ckpts=None,
+        use_cuda=True,
+        use_fp16=False,
+        bsz=384,
+    ):
+        screen_folds = [int(f) for f in screen_folds]
+        if _tq2_complete(tq2_paths, n_mols, tq.code_width):
+            logger.info(f"reusing 2-bit codes at {tq2_paths['dir']}")
+            return
+        logger.info(
+            f"writing 2-bit turboquant codes for folds {screen_folds} "
+            f"under {tq2_paths['dir']}"
+        )
+        os.makedirs(tq2_paths["dir"], exist_ok=True)
+
+        reps = mol_reps_by_fold
+        if reps is None or any(f not in reps for f in screen_folds):
+            if fold_version is not None:
+                npy_ready, pkl_ready = self._mol_cache_ready(
+                    fold_version, folds=screen_folds
+                )
+                if npy_ready or pkl_ready:
+                    reps, cache_names, _kind = self._load_mol_fold_cache(
+                        fold_version, folds=screen_folds
+                    )
+                    if names is None:
+                        names = cache_names
+            else:
+                reps = None
+        if reps is not None and all(f in reps for f in screen_folds):
+            from unimol.turboquant import write_codes_chunked
+
+            emb_dim = int(reps[screen_folds[0]].shape[1])
+            if emb_dim != tq.dim:
+                raise ValueError(
+                    f"embedding dim {emb_dim} != turboquant dim {tq.dim}"
+                )
+            for fold in screen_folds:
+                write_codes_chunked(tq2_paths["codes"][int(fold)], reps[fold], tq)
+            _write_names_npz(tq2_paths["names"], names)
+            logger.info(
+                f"wrote 2-bit codes from mol cache for folds {screen_folds} "
+                f"({n_mols} mols)"
+            )
+            return
+
+        if mol_dataset is None:
+            raise RuntimeError(
+                f"2-bit codes missing at {tq2_paths['dir']} and no mol cache "
+                "or dataset to encode"
+            )
+        if fold_encoders is None:
+            if model is None or ckpts is None:
+                raise RuntimeError(
+                    "2-bit codes require fold encoders or a mol cache"
+                )
+            fold_encoders = {}
+            for fold in screen_folds:
+                state = checkpoint_utils.load_checkpoint_to_cpu(ckpts[fold])
+                model.load_state_dict(state["model"], strict=False)
+                fold_encoders[fold] = self._snapshot_mol_encoder(
+                    model, use_cuda, use_fp16
+                )
+        self._stream_tq2_codes(
+            fold_encoders,
+            mol_dataset,
+            use_cuda,
+            bsz,
+            tq,
+            tq2_paths,
+            names=names,
+        )
+        fold_encoders.clear()
+        if use_cuda:
+            torch.cuda.empty_cache()
+
+    def retrieval_multi_folds(self, model, pocket_path, save_path, mol_data_path, fold_version, use_cache=True, use_cuda=True, retrieval_mode="full", cascade_frac=0.2, cascade_tier_fracs=None, cascade_gate_folds=None, write_cache=True, retrieval_bsz=None, screen_folds=None, store_all=False, **kwargs):
         ckpts = self._fold_checkpoints(fold_version)
 
         # Encode pockets once (cheap) up front; both retrieval modes need them.
@@ -1707,26 +2001,42 @@ class DrugCLIP(UnicoreTask):
             )
             return
 
-        # Streaming full mode: one encode (or chunked cache matmul) pass writes
-        # fold-mean scores to an on-disk memmap; a cheap CPU pass then computes
-        # exact per-pocket median/MAD, max-over-pockets, and top-k.
+        # Streaming full mode: score the selected folds (default 1, 4, 5) with
+        # native fold-mean + z-score ranking. 2-bit TurboQuant codes are stored
+        # as a side product; ranking never uses dequantized scores.
         # use_cache=True: create-or-reuse mol fold npy/pkl. False: fused score
         # only, ignore mol caches. write_cache persists pocket embeddings only.
+        n_all_folds = len(ckpts)
+        screen_folds = _resolve_screen_folds(screen_folds, n_all_folds)
+        store_all = bool(store_all)
+        logger.info(
+            f"full mode screen folds={screen_folds} "
+            f"topk={FULL_SCREEN_TOPK} store_all={store_all}"
+        )
+
         use_fp16 = next(model.parameters()).dtype == torch.float16
         bsz = retrieval_bsz if retrieval_bsz and retrieval_bsz > 0 else _DEFAULT_RETRIEVAL_BSZ_FULL
 
         pocket_reps_by_fold = self._cache_pocket_reps_by_fold(
-            model, ckpts, pocket_data, pocket_path, fold_version, use_cuda, write_cache
+            model, ckpts, pocket_data, pocket_path, fold_version, use_cuda,
+            write_cache, folds=screen_folds,
         )
         n_pockets = next(iter(pocket_reps_by_fold.values())).shape[0]
+        emb_dim = int(next(iter(pocket_reps_by_fold.values())).shape[1])
 
         score_cache_dir = self._score_memmap_cache_dir(
-            fold_version, mol_data_path, pocket_path
+            fold_version, mol_data_path, pocket_path, screen_folds=screen_folds
         )
-        npy_ready, pkl_ready = self._mol_cache_ready(fold_version)
+        npy_ready, pkl_ready = self._mol_cache_ready(
+            fold_version, folds=screen_folds
+        )
         caches_ready = npy_ready or pkl_ready
         write_mol_cache = bool(use_cache) and not caches_ready
         use_mol_cache = bool(use_cache) and caches_ready
+
+        mol_tag = self._mol_library_cache_tag(mol_data_path)
+        tq2_paths = _tq2_paths(fold_version, mol_tag, screen_folds)
+        tq = self._load_or_create_tq2(_tq2_codec_path(fold_version), dim=emb_dim)
 
         mol_dataset = None
         mol_reps_by_fold = {}
@@ -1734,7 +2044,7 @@ class DrugCLIP(UnicoreTask):
 
         if use_mol_cache:
             mol_reps_by_fold, mol_names, _kind = self._load_mol_fold_cache(
-                fold_version
+                fold_version, folds=screen_folds
             )
             n_mols = len(mol_names)
         else:
@@ -1745,12 +2055,15 @@ class DrugCLIP(UnicoreTask):
             if write_mol_cache and os.path.isdir(score_cache_dir):
                 shutil.rmtree(score_cache_dir, ignore_errors=True)
 
+        tq2_ready = _tq2_complete(tq2_paths, n_mols, tq.code_width)
+
         memmap, n_written, paths = self._open_or_create_score_memmap(
             score_cache_dir, n_pockets, n_mols
         )
         if write_mol_cache:
             n_written = 0
 
+        fold_encoders = None
         if n_written >= n_mols:
             names = self._load_names_sidecar(paths, n_mols)
             if names is None:
@@ -1775,11 +2088,12 @@ class DrugCLIP(UnicoreTask):
                 use_cuda,
             )
             names = list(mol_names)
-            mol_reps_by_fold.clear()
         else:
+            if not tq2_ready:
+                n_written = 0
             fold_encoders = {}
-            for fold, ckpt in enumerate(ckpts):
-                state = checkpoint_utils.load_checkpoint_to_cpu(ckpt)
+            for fold in screen_folds:
+                state = checkpoint_utils.load_checkpoint_to_cpu(ckpts[fold])
                 model.load_state_dict(state["model"], strict=False)
                 fold_encoders[fold] = self._snapshot_mol_encoder(
                     model, use_cuda, use_fp16
@@ -1796,15 +2110,44 @@ class DrugCLIP(UnicoreTask):
                 run_label="full retrieval",
                 write_mol_cache=write_mol_cache,
                 fold_version=fold_version if write_mol_cache else None,
+                write_tq2=not tq2_ready,
+                tq=tq if not tq2_ready else None,
+                tq2_paths=tq2_paths if not tq2_ready else None,
             )
             fold_encoders.clear()
+            fold_encoders = None
             if use_cuda:
                 torch.cuda.empty_cache()
 
-        self._select_topk_from_score_memmap(memmap, fold_version, names, save_path)
+        self._ensure_tq2_codes(
+            tq2_paths,
+            tq,
+            screen_folds,
+            n_mols,
+            names,
+            mol_reps_by_fold=mol_reps_by_fold or None,
+            fold_version=fold_version,
+            mol_dataset=mol_dataset,
+            fold_encoders=fold_encoders,
+            model=model,
+            ckpts=ckpts,
+            use_cuda=use_cuda,
+            use_fp16=use_fp16,
+            bsz=bsz,
+        )
+        mol_reps_by_fold.clear()
+
+        self._select_topk_from_score_memmap(
+            memmap,
+            fold_version,
+            names,
+            save_path,
+            k=FULL_SCREEN_TOPK,
+            store_all=store_all,
+        )
 
         # Always drop score memmap scratch after ranking (pocket / mol caches
-        # may still be kept).
+        # and 2-bit codes may still be kept).
         del memmap
         try:
             if os.path.isdir(score_cache_dir):
