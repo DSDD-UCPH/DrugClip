@@ -1,7 +1,8 @@
 from pathlib import Path
 import importlib
 
-# automatically import any Python files in the criterions/ directory
 for file in sorted(Path(__file__).parent.glob("*.py")):
-    if not file.name.startswith("_"):
-        importlib.import_module("unimol.losses." + file.name[:-3])
+    stem = file.stem
+    if not stem or stem.startswith("_") or not stem.isidentifier():
+        continue
+    importlib.import_module("unimol.losses." + stem)
