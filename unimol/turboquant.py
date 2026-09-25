@@ -279,13 +279,17 @@ class TurboQuant:
         return self.rotate(x)
 
     def quantize_indices(self, x, already_rotated=False):
-        """Nearest codebook index per coordinate. x: (N, d) unit vectors."""
+        """Nearest codebook index per coordinate. x: (N, d) unit vectors.
+
+        A strict-< scan over the (at most 16) levels matches abs-argmin's
+        first-index rule without an (N, d, n_levels) temporary. Float32
+        midpoints are not used: they are not exact Voronoi boundaries, so
+        searchsorted disagrees with argmin on values that land on a midpoint.
+        """
         y = np.ascontiguousarray(x, dtype=np.float32)
         if not already_rotated:
             y = self.rotate(y)
-        # (N, d, 1) - (L,) -> (N, d, L)
-        dist = np.abs(y[..., None] - self.codebook.reshape(1, 1, -1))
-        return dist.argmin(axis=-1).astype(np.uint8)
+        return nearest_code_indices(y, self.codebook)
 
     def quantize(self, x, already_rotated=False):
         """Packed (N, code_width) uint8 codes, or unpacked (N, d) if bits>4."""
@@ -309,6 +313,14 @@ class TurboQuant:
         y = self.dequantize(codes, packed=packed)
         return y @ self.rotation.T
 
+    def torch_quant_tables(self, device):
+        """Rotation and codebook on `device` for `quantize_torch`."""
+        import torch
+
+        rotation = torch.from_numpy(np.ascontiguousarray(self.rotation)).to(device)
+        codebook = torch.from_numpy(np.ascontiguousarray(self.codebook)).to(device)
+        return rotation, codebook
+
     def metadata(self):
         return {
             "version": self.version,
@@ -317,6 +329,98 @@ class TurboQuant:
             "n_levels": self.n_levels,
             "code_width": self.code_width,
         }
+
+
+def codebook_midpoints(codebook):
+    """Decision boundaries between a sorted scalar codebook. Shape (L-1,)."""
+    c = np.ascontiguousarray(codebook, dtype=np.float32).reshape(-1)
+    return (0.5 * (c[:-1] + c[1:])).astype(np.float32, copy=False)
+
+
+def nearest_code_indices(y, codebook):
+    """Abs-argmin index per coordinate. Ties keep the lower index.
+
+    y: (..., d) float32. codebook: (L,) sorted float32. No (..., d, L) temporary.
+    """
+    c = np.ascontiguousarray(codebook, dtype=np.float32).reshape(-1)
+    y = np.ascontiguousarray(y, dtype=np.float32)
+    idx = np.zeros(y.shape, dtype=np.uint8)
+    best = np.abs(y - c[0])
+    for k in range(1, int(c.shape[0])):
+        dist = np.abs(y - c[k])
+        take = dist < best
+        idx = np.where(take, np.uint8(k), idx)
+        best = np.where(take, dist, best)
+    return idx
+
+
+def pack_indices_torch(idx, bits):
+    """Pack (N, d) integer indices to (N, code_width) uint8 on idx's device.
+
+    Matches `pack_indices` for bits in {1, 2, 3, 4}.
+    """
+    import torch
+
+    bits = int(bits)
+    if idx.ndim != 2:
+        raise ValueError(f"expected (N, d) indices, got {tuple(idx.shape)}")
+    n, dim = idx.shape
+    if bits in (1, 2, 4):
+        group = 8 // bits
+        width = packed_code_width(dim, bits)
+        blocks = idx.reshape(n, width, group).to(torch.int32)
+        out = torch.zeros((n, width), dtype=torch.int32, device=idx.device)
+        for i in range(group):
+            shift = bits * (group - 1 - i)
+            out = torch.bitwise_or(out, torch.bitwise_left_shift(blocks[:, :, i], shift))
+        return out.to(torch.uint8)
+    if bits == 3:
+        width = packed_code_width(dim, bits)
+        n_groups = dim // 8
+        g = (idx.reshape(n, n_groups, 8) & 7).to(torch.int32)
+        b0 = (
+            torch.bitwise_left_shift(g[:, :, 0], 5)
+            | torch.bitwise_left_shift(g[:, :, 1], 2)
+            | torch.bitwise_right_shift(g[:, :, 2], 1)
+        )
+        b1 = (
+            torch.bitwise_left_shift(torch.bitwise_and(g[:, :, 2], 1), 7)
+            | torch.bitwise_left_shift(g[:, :, 3], 4)
+            | torch.bitwise_left_shift(g[:, :, 4], 1)
+            | torch.bitwise_right_shift(g[:, :, 5], 2)
+        )
+        b2 = (
+            torch.bitwise_left_shift(torch.bitwise_and(g[:, :, 5], 3), 6)
+            | torch.bitwise_left_shift(g[:, :, 6], 3)
+            | g[:, :, 7]
+        )
+        return torch.stack((b0, b1, b2), dim=-1).reshape(n, width).to(torch.uint8)
+    raise ValueError(f"no packer for bits={bits}")
+
+
+def quantize_torch(emb, rotation, codebook, bits):
+    """Quantize embeddings on `emb`'s device.
+
+    emb: (N, d) float tensor in the original frame.
+    rotation: (d, d) float tensor. codebook: (n_levels,) float tensor.
+    Returns packed uint8 (N, code_width).
+
+    Same strict-< scan as `nearest_code_indices`, so ties keep the lower
+    index and codes match `TurboQuant.quantize` bit for bit. A float32
+    midpoint bucketize does not: the stored midpoint is not an exact tie.
+    """
+    import torch
+
+    y = emb.float() @ rotation
+    c = codebook.reshape(-1)
+    idx = torch.zeros(y.shape, dtype=torch.uint8, device=y.device)
+    best = torch.abs(y - c[0])
+    for k in range(1, int(c.shape[0])):
+        dist = torch.abs(y - c[k])
+        take = dist < best
+        idx = torch.where(take, torch.tensor(k, dtype=torch.uint8, device=y.device), idx)
+        best = torch.where(take, dist, best)
+    return pack_indices_torch(idx, bits)
 
 
 def write_codes_chunked(path, embs, tq, chunk=65536):

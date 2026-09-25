@@ -1,7 +1,7 @@
 # Copyright (c) DP Technology.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-"""Full-mode screening helpers (fold subset, native top-k, 2-bit code layout).
+"""Full-mode screening helpers (fold subset, native top-k, TurboQuant code layout).
 
 Importable without torch / unicore.
 """
@@ -13,8 +13,12 @@ import numpy as np
 # Full-mode screening defaults (0-based fold indices). Cascade is unchanged.
 DEFAULT_FULL_SCREEN_FOLDS = (1, 4, 5)
 FULL_SCREEN_TOPK = 100_000
-TQ2_BITS = 2
-TQ2_SEED = 1
+DEFAULT_TQ_BITS = 2
+TQ_SEED = 1
+# Names kept so existing 2-bit call sites keep working.
+TQ2_BITS = DEFAULT_TQ_BITS
+TQ2_SEED = TQ_SEED
+TQ_BITS_CHOICES = (0, 1, 2, 3, 4)
 
 
 def _resolve_screen_folds(screen_folds, n_folds, default=DEFAULT_FULL_SCREEN_FOLDS):
@@ -52,22 +56,25 @@ def _full_screen_k(n_mols, topk=FULL_SCREEN_TOPK):
     return max(1, min(n_mols, int(topk)))
 
 
-def _tq2_root(fold_version):
-    return os.path.join(f"./data/encoded_mol_embs/{fold_version}", "tq2")
+def _tq_root(fold_version, bits=DEFAULT_TQ_BITS):
+    # bits=2 stays `tq2/`, so existing codecs and codes remain valid.
+    return os.path.join(
+        f"./data/encoded_mol_embs/{fold_version}", f"tq{int(bits)}"
+    )
 
 
-def _tq2_codec_path(fold_version):
-    # One frozen 2-bit codec (rotation + codebook) for every LMDB of this
-    # fold_version. Codes and names stay under the per-library tag directory.
-    return os.path.join(_tq2_root(fold_version), "turboquant.npz")
+def _tq_codec_path(fold_version, bits=DEFAULT_TQ_BITS):
+    # One frozen codec (rotation + codebook) per bit width for every LMDB of
+    # this fold_version. Codes and names stay under the per-library tag.
+    return os.path.join(_tq_root(fold_version, bits), "turboquant.npz")
 
 
-def _tq2_dir(fold_version, mol_tag):
-    return os.path.join(_tq2_root(fold_version), str(mol_tag))
+def _tq_dir(fold_version, mol_tag, bits=DEFAULT_TQ_BITS):
+    return os.path.join(_tq_root(fold_version, bits), str(mol_tag))
 
 
-def _tq2_paths(fold_version, mol_tag, screen_folds):
-    cache_dir = _tq2_dir(fold_version, mol_tag)
+def _tq_paths(fold_version, mol_tag, screen_folds, bits=DEFAULT_TQ_BITS):
+    cache_dir = _tq_dir(fold_version, mol_tag, bits)
     return {
         "dir": cache_dir,
         "names": os.path.join(cache_dir, "names.npz"),
@@ -76,6 +83,22 @@ def _tq2_paths(fold_version, mol_tag, screen_folds):
             for f in screen_folds
         },
     }
+
+
+def _tq2_root(fold_version):
+    return _tq_root(fold_version, bits=2)
+
+
+def _tq2_codec_path(fold_version):
+    return _tq_codec_path(fold_version, bits=2)
+
+
+def _tq2_dir(fold_version, mol_tag):
+    return _tq_dir(fold_version, mol_tag, bits=2)
+
+
+def _tq2_paths(fold_version, mol_tag, screen_folds):
+    return _tq_paths(fold_version, mol_tag, screen_folds, bits=2)
 
 
 def _write_names_npz(path, names):
@@ -94,7 +117,7 @@ def _load_names_npz(path):
         return [str(x) for x in data["names"]]
 
 
-def _tq2_codes_ok(path, n_mols, code_width):
+def _tq_codes_ok(path, n_mols, code_width):
     if not os.path.isfile(path):
         return False
     try:
@@ -107,7 +130,11 @@ def _tq2_codes_ok(path, n_mols, code_width):
     )
 
 
-def _tq2_complete(paths, n_mols, code_width):
+def _tq2_codes_ok(path, n_mols, code_width):
+    return _tq_codes_ok(path, n_mols, code_width)
+
+
+def _tq_complete(paths, n_mols, code_width):
     if not os.path.isfile(paths["names"]):
         return False
     try:
@@ -117,6 +144,10 @@ def _tq2_complete(paths, n_mols, code_width):
     if len(names) != int(n_mols):
         return False
     return all(
-        _tq2_codes_ok(path, n_mols, code_width)
+        _tq_codes_ok(path, n_mols, code_width)
         for path in paths["codes"].values()
     )
+
+
+def _tq2_complete(paths, n_mols, code_width):
+    return _tq_complete(paths, n_mols, code_width)

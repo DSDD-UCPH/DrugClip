@@ -74,7 +74,7 @@ def main(args):
 
     retrieval_bsz = args.retrieval_bsz if args.retrieval_bsz and args.retrieval_bsz > 0 else None
 
-    task.retrieval_multi_folds(model, args.pocket_path, args.save_path, args.mol_path, fold_version=args.fold_version, use_cache=args.use_cache, use_cuda=use_cuda, retrieval_mode=args.retrieval_mode, cascade_frac=args.cascade_frac, cascade_tier_fracs=args.cascade_tier_fracs, cascade_gate_folds=args.cascade_gate_folds, write_cache=args.write_cache, retrieval_bsz=retrieval_bsz, screen_folds=args.screen_folds, store_all=args.store_all)
+    task.retrieval_multi_folds(model, args.pocket_path, args.save_path, args.mol_path, fold_version=args.fold_version, use_cache=args.use_cache, use_cuda=use_cuda, retrieval_mode=args.retrieval_mode, cascade_frac=args.cascade_frac, cascade_tier_fracs=args.cascade_tier_fracs, cascade_gate_folds=args.cascade_gate_folds, write_cache=args.write_cache, retrieval_bsz=retrieval_bsz, screen_folds=args.screen_folds, store_all=args.store_all, tq_bits=args.tq_bits)
 
 
 def cli_main():
@@ -101,7 +101,8 @@ def cli_main():
         return [int(x) for x in str(v).split(",") if x.strip() != ""]
 
     parser.add_argument("--use-cache", type=str2bool, default=False, help="if True, reuse a complete mol embedding cache (fold*.npy or legacy fold*.pkl) or write float16 npy during the fused score pass; if False, fused score only and ignore mol caches")
-    parser.add_argument("--retrieval-mode", type=str, default="full", choices=["full", "cascade"], help="full: encode --screen-folds (default 1,4,5) over the whole library, rank with native fold-mean scores, and store 2-bit codes; cascade: configurable multi-tier gating that scores one fold per tier to progressively narrow the pool, then re-scores the surviving pool through all folds")
+    parser.add_argument("--retrieval-mode", type=str, default="full", choices=["full", "cascade"], help="full: encode --screen-folds (default 1,4,5) over the whole library, rank with native fold-mean scores, and store TurboQuant codes at --tq-bits; cascade: configurable multi-tier gating that scores one fold per tier to progressively narrow the pool, then re-scores the surviving pool through all folds")
+    parser.add_argument("--tq-bits", type=int, default=2, choices=[0, 1, 2, 3, 4], help="TurboQuant code width for full mode. 0 stores no codes. 1-4 pack that many bits per coordinate (default 2). Ignored in cascade mode. bits=2 reuses ./data/encoded_mol_embs/<fold_version>/tq2/.")
     parser.add_argument("--cascade-frac", type=float, default=0.2, help="tier-1 fraction of the library kept after the first gate in cascade mode; each tier's kept fraction is this value times the matching --cascade-tier-fracs multiplier")
     parser.add_argument("--cascade-tier-fracs", type=float_list, default=[1.0, 0.5, 0.25], help="comma-separated multipliers of --cascade-frac, one per gating tier (e.g. 1.0,0.5,0.25); the number of entries sets how many single-fold gating tiers run before the full-fold rescore")
     parser.add_argument("--cascade-gate-folds", type=int_list, default=[4, 1], help="comma-separated fold index used by each gating tier (e.g. 4,1); shorter than --cascade-tier-fracs is padded with the remaining unused folds in ascending order")

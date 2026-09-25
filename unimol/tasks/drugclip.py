@@ -34,15 +34,16 @@ from unimol.data.lmdb_dataset import (
 from unimol.packed_lmdb import open_mol_lmdb
 from unimol.full_screen import (
     FULL_SCREEN_TOPK,
-    TQ2_BITS,
-    TQ2_SEED,
+    TQ_BITS_CHOICES,
+    TQ_SEED,
     _resolve_screen_folds,
     _screen_folds_tag,
     _full_screen_k,
-    _tq2_codec_path,
-    _tq2_paths,
+    _tq_codec_path,
+    _tq_codes_ok,
+    _tq_complete,
+    _tq_paths,
     _write_names_npz,
-    _tq2_complete,
 )
 from unimol.tasks._drugclip_rank import (
     _SCORE_MEMMAP_SELECT_CHUNK,
@@ -1274,21 +1275,27 @@ class DrugCLIP(UnicoreTask):
         write_tq2=False,
         tq=None,
         tq2_paths=None,
+        write_scores=True,
+        score_skip_until=0,
     ):
         # Stream the molecule library through all resident fold encoders in one
         # DataLoader pass. Per batch, compute the fold-mean pocket@mol score on
         # GPU and write columns into the on-disk memmap. Never materializes
         # (n_mols x emb_dim) embeddings or a full (n_pockets x n_mols) host array.
         # When write_mol_cache, also stream float16 fold{i}.npy memmaps for the
-        # encoded folds only. When write_tq2, stream packed 2-bit codes.
+        # encoded folds only. When write_tq2, pack codes on device from the same
+        # embeddings and copy only the packed bytes to host.
+        # write_scores=False encodes for codes only (score memmap already done).
+        # score_skip_until skips rewriting score columns already on disk.
         n_mols = len(mol_dataset)
         n_pockets = memmap.shape[0]
         dtype = memmap.dtype
+        score_skip_until = int(score_skip_until)
         if write_mol_cache:
             if not fold_version:
                 raise ValueError("write_mol_cache requires fold_version")
             n_written = 0
-        if n_written >= n_mols:
+        if write_scores and n_written >= n_mols and score_skip_until == 0:
             names = self._load_names_sidecar(paths, n_mols)
             if names is None:
                 raise RuntimeError(
@@ -1332,10 +1339,14 @@ class DrugCLIP(UnicoreTask):
             **self._mol_dataloader_kwargs(use_cuda),
         )
         device = torch.device("cuda") if use_cuda else torch.device("cpu")
-        pocket_t_by_fold = {
-            fold: torch.from_numpy(np.ascontiguousarray(reps)).to(device).float()
-            for fold, reps in pocket_reps_by_fold.items()
-        }
+        pocket_t_by_fold = {}
+        if write_scores:
+            pocket_t_by_fold = {
+                fold: torch.from_numpy(np.ascontiguousarray(reps)).to(device).float()
+                for fold, reps in pocket_reps_by_fold.items()
+            }
+        tq_rotation = None
+        tq_codebook = None
         n_folds = len(fold_encoders)
         remaining = n_mols - n_written
         n_iters = (remaining + bsz - 1) // bsz
@@ -1344,7 +1355,9 @@ class DrugCLIP(UnicoreTask):
         if write_mol_cache:
             extra.append("writing mol npy cache")
         if write_tq2:
-            extra.append("writing 2-bit codes")
+            extra.append(f"writing {int(tq.bits)}-bit codes" if tq is not None else "writing codes")
+        if not write_scores:
+            extra.append("scores unchanged")
         extra_s = f", {', '.join(extra)}" if extra else ""
         logger.info(
             f"fused fold-mean scoring{label_suffix}: iterations={n_iters}, "
@@ -1355,6 +1368,9 @@ class DrugCLIP(UnicoreTask):
             if tq is None or tq2_paths is None:
                 raise ValueError("write_tq2 requires tq and tq2_paths")
             os.makedirs(tq2_paths["dir"], exist_ok=True)
+            from unimol.turboquant import quantize_torch
+
+            tq_rotation, tq_codebook = tq.torch_quant_tables(device)
         offset = n_written
         emb_mms = None
         npy_paths = None
@@ -1404,41 +1420,68 @@ class DrugCLIP(UnicoreTask):
                     if write_tq2:
                         if tq2_mms is None:
                             os.makedirs(tq2_paths["dir"], exist_ok=True)
+                            resume_codes = n_written > 0 and all(
+                                _tq_codes_ok(
+                                    tq2_paths["codes"][int(enc_fold)],
+                                    n_mols,
+                                    tq.code_width,
+                                )
+                                for enc_fold in fold_encoders
+                            )
                             tq2_mms = {}
                             for enc_fold in fold_encoders:
                                 code_path = tq2_paths["codes"][int(enc_fold)]
                                 parent = os.path.dirname(code_path)
                                 if parent:
                                     os.makedirs(parent, exist_ok=True)
-                                tq2_mms[int(enc_fold)] = np.lib.format.open_memmap(
-                                    code_path,
-                                    mode="w+",
-                                    dtype=np.uint8,
-                                    shape=(n_mols, int(tq.code_width)),
-                                )
+                                if resume_codes:
+                                    tq2_mms[int(enc_fold)] = np.lib.format.open_memmap(
+                                        code_path, mode="r+"
+                                    )
+                                else:
+                                    tq2_mms[int(enc_fold)] = np.lib.format.open_memmap(
+                                        code_path,
+                                        mode="w+",
+                                        dtype=np.uint8,
+                                        shape=(n_mols, int(tq.code_width)),
+                                    )
                             logger.info(
-                                f"writing 2-bit codes under {tq2_paths['dir']} "
+                                f"{'resuming' if resume_codes else 'writing'} "
+                                f"{int(tq.bits)}-bit codes under {tq2_paths['dir']} "
                                 f"folds={sorted(tq2_mms)} "
-                                f"(shape=({n_mols}, {tq.code_width}))"
+                                f"(shape=({n_mols}, {tq.code_width}), "
+                                f"from_row={n_written})"
                             )
-                        tq2_mms[int(fold)][offset:offset + batch_len] = tq.quantize(
-                            emb_f.detach().cpu().numpy()
+                        packed = quantize_torch(
+                            emb, tq_rotation, tq_codebook, tq.bits
                         )
-                    score = pocket_t_by_fold[fold] @ emb_f.t()
-                    if mean_score is None:
-                        mean_score = score
-                    else:
-                        mean_score = mean_score + score
-                mean_score = mean_score / float(n_folds)
-                score_np = mean_score.detach().cpu().numpy().astype(dtype, copy=False)
-                memmap[:, offset:offset + batch_len] = score_np
+                        tq2_mms[int(fold)][offset:offset + batch_len] = (
+                            packed.detach().cpu().numpy()
+                        )
+                    if write_scores:
+                        score = pocket_t_by_fold[fold] @ emb_f.t()
+                        if mean_score is None:
+                            mean_score = score
+                        else:
+                            mean_score = mean_score + score
+                if write_scores:
+                    mean_score = mean_score / float(n_folds)
+                    score_np = mean_score.detach().cpu().numpy().astype(
+                        dtype, copy=False
+                    )
+                    batch_end = offset + batch_len
+                    write_from = max(offset, score_skip_until)
+                    if write_from < batch_end:
+                        local = write_from - offset
+                        memmap[:, write_from:batch_end] = score_np[:, local:]
                 names_acc.extend(sample["smi_name"])
                 offset += batch_len
                 if batch_idx % flush_interval == 0:
-                    memmap.flush()
-                    self._flush_score_memmap_meta(
-                        paths, n_pockets, n_mols, offset, dtype
-                    )
+                    if write_scores and offset > score_skip_until:
+                        memmap.flush()
+                        self._flush_score_memmap_meta(
+                            paths, n_pockets, n_mols, offset, dtype
+                        )
                     if emb_mms is not None:
                         for mm in emb_mms.values():
                             mm.flush()
@@ -1447,9 +1490,10 @@ class DrugCLIP(UnicoreTask):
                             mm.flush()
         if use_cuda:
             torch.cuda.synchronize()
-        memmap.flush()
-        self._flush_score_memmap_meta(paths, n_pockets, n_mols, offset, dtype)
-        self._write_names_sidecar(paths, names_acc)
+        if write_scores:
+            memmap.flush()
+            self._flush_score_memmap_meta(paths, n_pockets, n_mols, offset, dtype)
+            self._write_names_sidecar(paths, names_acc)
         if emb_mms is not None:
             for mm in emb_mms.values():
                 mm.flush()
@@ -1463,7 +1507,8 @@ class DrugCLIP(UnicoreTask):
                 mm.flush()
             _write_names_npz(tq2_paths["names"], names_acc)
             logger.info(
-                f"wrote 2-bit code names ({len(names_acc)}) to {tq2_paths['names']}"
+                f"wrote {int(tq.bits)}-bit code names ({len(names_acc)}) "
+                f"to {tq2_paths['names']}"
             )
             del tq2_mms
         elapsed = time.perf_counter() - t0
@@ -1487,6 +1532,9 @@ class DrugCLIP(UnicoreTask):
         paths,
         use_cuda,
         chunk_size=None,
+        write_tq=False,
+        tq=None,
+        tq_paths=None,
     ):
         # Chunked fold-mean matmul from pre-encoded per-fold embeddings into the
         # score memmap. Batched fp16 bmm on GPU; mmap npy is not fully loaded.
@@ -1498,12 +1546,38 @@ class DrugCLIP(UnicoreTask):
         dtype = memmap.dtype
         emb_dim = int(mol_reps_by_fold[fold_ids[0]].shape[1])
         device = torch.device("cuda") if use_cuda else torch.device("cpu")
+        if write_tq and (tq is None or tq_paths is None):
+            raise ValueError("write_tq requires tq and tq_paths")
+        tq_mms = None
+        if write_tq:
+            os.makedirs(tq_paths["dir"], exist_ok=True)
+            tq_mms = {}
+            for fold in fold_ids:
+                code_path = tq_paths["codes"][int(fold)]
+                parent = os.path.dirname(code_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                tq_mms[int(fold)] = np.lib.format.open_memmap(
+                    code_path,
+                    mode="w+",
+                    dtype=np.uint8,
+                    shape=(n_mols, int(tq.code_width)),
+                )
+            logger.info(
+                f"writing {int(tq.bits)}-bit codes from mol cache "
+                f"under {tq_paths['dir']} folds={fold_ids}"
+            )
         logger.info(
             f"filling score memmap from cache: folds={n_folds}, "
             f"molecules={n_mols}, chunk={chunk_size}, cuda={use_cuda}"
         )
         t0 = time.perf_counter()
         if use_cuda:
+            from unimol.turboquant import quantize_torch
+
+            tq_rotation = tq_codebook = None
+            if write_tq:
+                tq_rotation, tq_codebook = tq.torch_quant_tables(device)
             pocket_stack = np.stack(
                 [
                     np.ascontiguousarray(pocket_reps_by_fold[f], dtype=np.float16)
@@ -1533,6 +1607,12 @@ class DrugCLIP(UnicoreTask):
                 memmap[:, start:end] = mean.detach().cpu().numpy().astype(
                     dtype, copy=False
                 )
+                if write_tq:
+                    for i, fold in enumerate(fold_ids):
+                        packed = quantize_torch(
+                            mol_t[i], tq_rotation, tq_codebook, tq.bits
+                        )
+                        tq_mms[int(fold)][start:end] = packed.detach().cpu().numpy()
             if device.type == "cuda":
                 torch.cuda.synchronize()
             del pocket_t, mol_t, mol_host
@@ -1555,9 +1635,21 @@ class DrugCLIP(UnicoreTask):
                 scores = np.matmul(pocket_stack, np.transpose(mol_stack, (0, 2, 1)))
                 mean = scores.mean(axis=0).astype(dtype, copy=False)
                 memmap[:, start:end] = mean
+                if write_tq:
+                    for i, fold in enumerate(fold_ids):
+                        tq_mms[int(fold)][start:end] = tq.quantize(mol_stack[i])
         memmap.flush()
         self._flush_score_memmap_meta(paths, n_pockets, n_mols, n_mols, dtype)
         self._write_names_sidecar(paths, names)
+        if tq_mms is not None:
+            for mm in tq_mms.values():
+                mm.flush()
+            del tq_mms
+            _write_names_npz(tq_paths["names"], names)
+            logger.info(
+                f"wrote {int(tq.bits)}-bit codes from mol cache "
+                f"({n_mols} mols) under {tq_paths['dir']}"
+            )
         elapsed = time.perf_counter() - t0
         mols_per_sec = n_mols / elapsed if elapsed > 0 else 0.0
         logger.info(
@@ -1783,15 +1875,16 @@ class DrugCLIP(UnicoreTask):
             )
         return results
 
-    def _load_or_create_tq2(self, codec_path, dim=128):
+    def _load_or_create_tq(self, codec_path, dim=128, bits=2):
         from unimol.turboquant import TurboQuant
 
         dim = int(dim)
+        bits = int(bits)
         if os.path.isfile(codec_path):
             tq = TurboQuant.load(codec_path)
-            if tq.bits != TQ2_BITS:
+            if tq.bits != bits:
                 raise ValueError(
-                    f"expected {TQ2_BITS}-bit turboquant at {codec_path}, "
+                    f"expected {bits}-bit turboquant at {codec_path}, "
                     f"got bits={tq.bits}"
                 )
             if tq.dim != dim:
@@ -1802,10 +1895,10 @@ class DrugCLIP(UnicoreTask):
         parent = os.path.dirname(os.path.abspath(codec_path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        tq = TurboQuant.create(dim=dim, bits=TQ2_BITS, seed=TQ2_SEED)
+        tq = TurboQuant.create(dim=dim, bits=bits, seed=TQ_SEED)
         tq.save(codec_path)
         logger.info(
-            f"wrote {TQ2_BITS}-bit turboquant codec {codec_path} "
+            f"wrote {bits}-bit turboquant codec {codec_path} "
             f"dim={dim} version={tq.version}"
         )
         return tq
@@ -1833,6 +1926,10 @@ class DrugCLIP(UnicoreTask):
             **self._mol_dataloader_kwargs(use_cuda),
         )
         os.makedirs(tq2_paths["dir"], exist_ok=True)
+        from unimol.turboquant import quantize_torch
+
+        device = torch.device("cuda") if use_cuda else torch.device("cpu")
+        tq_rotation, tq_codebook = tq.torch_quant_tables(device)
         tq2_mms = {}
         for fold in fold_encoders:
             code_path = tq2_paths["codes"][int(fold)]
@@ -1846,7 +1943,7 @@ class DrugCLIP(UnicoreTask):
                 shape=(n_mols, int(tq.code_width)),
             )
         logger.info(
-            f"encoding 2-bit codes{f' ({run_label})' if run_label else ''}: "
+            f"encoding {int(tq.bits)}-bit codes{f' ({run_label})' if run_label else ''}: "
             f"folds={sorted(fold_encoders)}, molecules={n_mols}, "
             f"batch_size={bsz}"
         )
@@ -1865,8 +1962,11 @@ class DrugCLIP(UnicoreTask):
                         )
                         if batch_len is None:
                             batch_len = int(emb.shape[0])
-                        tq2_mms[int(fold)][offset:offset + batch_len] = tq.quantize(
-                            emb.float().detach().cpu().numpy()
+                        packed = quantize_torch(
+                            emb, tq_rotation, tq_codebook, tq.bits
+                        )
+                        tq2_mms[int(fold)][offset:offset + batch_len] = (
+                            packed.detach().cpu().numpy()
                         )
                     if collect_names:
                         names_acc.extend(sample["smi_name"])
@@ -1887,7 +1987,7 @@ class DrugCLIP(UnicoreTask):
             names = names_acc
         _write_names_npz(tq2_paths["names"], names)
         logger.info(
-            f"wrote 2-bit codes for folds {sorted(fold_encoders)} "
+            f"wrote {int(tq.bits)}-bit codes for folds {sorted(fold_encoders)} "
             f"({n_mols} mols) under {tq2_paths['dir']}"
         )
         return names
@@ -1910,11 +2010,13 @@ class DrugCLIP(UnicoreTask):
         bsz=384,
     ):
         screen_folds = [int(f) for f in screen_folds]
-        if _tq2_complete(tq2_paths, n_mols, tq.code_width):
-            logger.info(f"reusing 2-bit codes at {tq2_paths['dir']}")
+        if _tq_complete(tq2_paths, n_mols, tq.code_width):
+            logger.info(
+                f"reusing {int(tq.bits)}-bit codes at {tq2_paths['dir']}"
+            )
             return
         logger.info(
-            f"writing 2-bit turboquant codes for folds {screen_folds} "
+            f"writing {int(tq.bits)}-bit turboquant codes for folds {screen_folds} "
             f"under {tq2_paths['dir']}"
         )
         os.makedirs(tq2_paths["dir"], exist_ok=True)
@@ -1945,7 +2047,7 @@ class DrugCLIP(UnicoreTask):
                 write_codes_chunked(tq2_paths["codes"][int(fold)], reps[fold], tq)
             _write_names_npz(tq2_paths["names"], names)
             logger.info(
-                f"wrote 2-bit codes from mol cache for folds {screen_folds} "
+                f"wrote {int(tq.bits)}-bit codes from mol cache for folds {screen_folds} "
                 f"({n_mols} mols)"
             )
             return
@@ -1980,7 +2082,7 @@ class DrugCLIP(UnicoreTask):
         if use_cuda:
             torch.cuda.empty_cache()
 
-    def retrieval_multi_folds(self, model, pocket_path, save_path, mol_data_path, fold_version, use_cache=True, use_cuda=True, retrieval_mode="full", cascade_frac=0.2, cascade_tier_fracs=None, cascade_gate_folds=None, write_cache=True, retrieval_bsz=None, screen_folds=None, store_all=False, **kwargs):
+    def retrieval_multi_folds(self, model, pocket_path, save_path, mol_data_path, fold_version, use_cache=True, use_cuda=True, retrieval_mode="full", cascade_frac=0.2, cascade_tier_fracs=None, cascade_gate_folds=None, write_cache=True, retrieval_bsz=None, screen_folds=None, store_all=False, tq_bits=2, **kwargs):
         ckpts = self._fold_checkpoints(fold_version)
 
         # Encode pockets once (cheap) up front; both retrieval modes need them.
@@ -2002,16 +2104,22 @@ class DrugCLIP(UnicoreTask):
             return
 
         # Streaming full mode: score the selected folds (default 1, 4, 5) with
-        # native fold-mean + z-score ranking. 2-bit TurboQuant codes are stored
-        # as a side product; ranking never uses dequantized scores.
-        # use_cache=True: create-or-reuse mol fold npy/pkl. False: fused score
-        # only, ignore mol caches. write_cache persists pocket embeddings only.
+        # native fold-mean + z-score ranking. TurboQuant codes (tq_bits 1-4,
+        # default 2) are a side product; ranking never uses dequantized scores.
+        # tq_bits 0 stores no codes. use_cache=True: create-or-reuse mol fold
+        # npy/pkl. False: fused score only, ignore mol caches. write_cache
+        # persists pocket embeddings only.
+        tq_bits = int(tq_bits)
+        if tq_bits not in TQ_BITS_CHOICES:
+            raise ValueError(
+                f"tq_bits must be one of {TQ_BITS_CHOICES}, got {tq_bits}"
+            )
         n_all_folds = len(ckpts)
         screen_folds = _resolve_screen_folds(screen_folds, n_all_folds)
         store_all = bool(store_all)
         logger.info(
             f"full mode screen folds={screen_folds} "
-            f"topk={FULL_SCREEN_TOPK} store_all={store_all}"
+            f"topk={FULL_SCREEN_TOPK} store_all={store_all} tq_bits={tq_bits}"
         )
 
         use_fp16 = next(model.parameters()).dtype == torch.float16
@@ -2035,8 +2143,16 @@ class DrugCLIP(UnicoreTask):
         use_mol_cache = bool(use_cache) and caches_ready
 
         mol_tag = self._mol_library_cache_tag(mol_data_path)
-        tq2_paths = _tq2_paths(fold_version, mol_tag, screen_folds)
-        tq = self._load_or_create_tq2(_tq2_codec_path(fold_version), dim=emb_dim)
+        write_tq = tq_bits > 0
+        tq = None
+        tq2_paths = None
+        if write_tq:
+            tq2_paths = _tq_paths(fold_version, mol_tag, screen_folds, bits=tq_bits)
+            tq = self._load_or_create_tq(
+                _tq_codec_path(fold_version, bits=tq_bits),
+                dim=emb_dim,
+                bits=tq_bits,
+            )
 
         mol_dataset = None
         mol_reps_by_fold = {}
@@ -2055,13 +2171,33 @@ class DrugCLIP(UnicoreTask):
             if write_mol_cache and os.path.isdir(score_cache_dir):
                 shutil.rmtree(score_cache_dir, ignore_errors=True)
 
-        tq2_ready = _tq2_complete(tq2_paths, n_mols, tq.code_width)
+        tq_ready = True
+        if write_tq:
+            tq_ready = _tq_complete(tq2_paths, n_mols, tq.code_width)
 
         memmap, n_written, paths = self._open_or_create_score_memmap(
             score_cache_dir, n_pockets, n_mols
         )
         if write_mol_cache:
             n_written = 0
+
+        def _snapshot_screen_encoders():
+            encoders = {}
+            for fold in screen_folds:
+                state = checkpoint_utils.load_checkpoint_to_cpu(ckpts[fold])
+                model.load_state_dict(state["model"], strict=False)
+                encoders[fold] = self._snapshot_mol_encoder(
+                    model, use_cuda, use_fp16
+                )
+            return encoders
+
+        need_codes = write_tq and not tq_ready
+        codes_resumable = False
+        if need_codes and 0 < n_written < n_mols:
+            codes_resumable = all(
+                _tq_codes_ok(path, n_mols, tq.code_width)
+                for path in tq2_paths["codes"].values()
+            )
 
         fold_encoders = None
         if n_written >= n_mols:
@@ -2074,10 +2210,43 @@ class DrugCLIP(UnicoreTask):
                     raise RuntimeError(
                         f"complete score memmap at {score_cache_dir} but names missing"
                     )
-            logger.info(
-                f"reusing complete score memmap at {score_cache_dir} "
-                f"({n_pockets}x{n_mols}); skipping encode"
-            )
+            if need_codes and use_mol_cache:
+                logger.info(
+                    f"reusing complete score memmap at {score_cache_dir} "
+                    f"({n_pockets}x{n_mols}); {tq_bits}-bit codes missing, "
+                    f"quantizing from the mol cache (no re-encode, scores unchanged)"
+                )
+            elif need_codes:
+                logger.info(
+                    f"reusing complete score memmap at {score_cache_dir} "
+                    f"({n_pockets}x{n_mols}); {tq_bits}-bit codes missing, "
+                    f"encoding once to write them (scores unchanged)"
+                )
+                fold_encoders = _snapshot_screen_encoders()
+                names = self._fused_foldmean_score_pass(
+                    fold_encoders,
+                    pocket_reps_by_fold,
+                    mol_dataset,
+                    use_cuda,
+                    bsz,
+                    memmap,
+                    paths,
+                    n_written=0,
+                    run_label="full retrieval codes",
+                    write_scores=False,
+                    write_tq2=True,
+                    tq=tq,
+                    tq2_paths=tq2_paths,
+                )
+                fold_encoders.clear()
+                fold_encoders = None
+                if use_cuda:
+                    torch.cuda.empty_cache()
+            else:
+                logger.info(
+                    f"reusing complete score memmap at {score_cache_dir} "
+                    f"({n_pockets}x{n_mols}); skipping encode"
+                )
         elif use_mol_cache:
             self._fill_score_memmap_from_pickles(
                 mol_reps_by_fold,
@@ -2086,18 +2255,17 @@ class DrugCLIP(UnicoreTask):
                 memmap,
                 paths,
                 use_cuda,
+                write_tq=need_codes,
+                tq=tq if need_codes else None,
+                tq_paths=tq2_paths if need_codes else None,
             )
             names = list(mol_names)
         else:
-            if not tq2_ready:
+            score_skip_until = 0
+            if need_codes and n_written > 0 and not codes_resumable:
+                score_skip_until = n_written
                 n_written = 0
-            fold_encoders = {}
-            for fold in screen_folds:
-                state = checkpoint_utils.load_checkpoint_to_cpu(ckpts[fold])
-                model.load_state_dict(state["model"], strict=False)
-                fold_encoders[fold] = self._snapshot_mol_encoder(
-                    model, use_cuda, use_fp16
-                )
+            fold_encoders = _snapshot_screen_encoders()
             names = self._fused_foldmean_score_pass(
                 fold_encoders,
                 pocket_reps_by_fold,
@@ -2110,31 +2278,33 @@ class DrugCLIP(UnicoreTask):
                 run_label="full retrieval",
                 write_mol_cache=write_mol_cache,
                 fold_version=fold_version if write_mol_cache else None,
-                write_tq2=not tq2_ready,
-                tq=tq if not tq2_ready else None,
-                tq2_paths=tq2_paths if not tq2_ready else None,
+                write_tq2=need_codes,
+                tq=tq if need_codes else None,
+                tq2_paths=tq2_paths if need_codes else None,
+                score_skip_until=score_skip_until,
             )
             fold_encoders.clear()
             fold_encoders = None
             if use_cuda:
                 torch.cuda.empty_cache()
 
-        self._ensure_tq2_codes(
-            tq2_paths,
-            tq,
-            screen_folds,
-            n_mols,
-            names,
-            mol_reps_by_fold=mol_reps_by_fold or None,
-            fold_version=fold_version,
-            mol_dataset=mol_dataset,
-            fold_encoders=fold_encoders,
-            model=model,
-            ckpts=ckpts,
-            use_cuda=use_cuda,
-            use_fp16=use_fp16,
-            bsz=bsz,
-        )
+        if write_tq:
+            self._ensure_tq2_codes(
+                tq2_paths,
+                tq,
+                screen_folds,
+                n_mols,
+                names,
+                mol_reps_by_fold=mol_reps_by_fold or None,
+                fold_version=fold_version,
+                mol_dataset=mol_dataset,
+                fold_encoders=fold_encoders,
+                model=model,
+                ckpts=ckpts,
+                use_cuda=use_cuda,
+                use_fp16=use_fp16,
+                bsz=bsz,
+            )
         mol_reps_by_fold.clear()
 
         self._select_topk_from_score_memmap(
@@ -2147,7 +2317,7 @@ class DrugCLIP(UnicoreTask):
         )
 
         # Always drop score memmap scratch after ranking (pocket / mol caches
-        # and 2-bit codes may still be kept).
+        # and TurboQuant codes may still be kept).
         del memmap
         try:
             if os.path.isdir(score_cache_dir):
