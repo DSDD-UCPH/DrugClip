@@ -1707,7 +1707,7 @@ class DrugCLIP(UnicoreTask):
 
         with open(save_path, "w") as f:
             for i in top_idx:
-                f.write(f"{names[i]},{res_max[i]}\n")
+                f.write(f"{names[i]},{res_max[i]:.4f}\n")
         logger.info(
             f"wrote top {k}/{n_mols}{frac_note} native scores to {save_path}"
         )
@@ -2875,7 +2875,7 @@ class DrugCLIP(UnicoreTask):
             with open(save_path, "w") as f:
                 for li in top_local:
                     global_i = cur_idx[li]
-                    f.write(f"{names[global_i]},{res_max[li]}\n")
+                    f.write(f"{names[global_i]},{res_max[li]:.4f}\n")
         finally:
             if gate_encoder is not None:
                 del gate_encoder

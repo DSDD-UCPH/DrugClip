@@ -66,7 +66,7 @@ WRITE_CACHE=True
 # DataLoader batch size for molecule encoding/scoring; 0 uses the internal default
 # (384 for full mode, 256 for cascade; single-fold gates scale to ~base*n_folds).
 # Raise toward 512 if VRAM allows.
-RETRIEVAL_BSZ=0
+RETRIEVAL_BSZ=1024
 # Batches prefetched per DataLoader worker (helps keep the GPU fed).
 PREFETCH_FACTOR=4
 
