@@ -77,11 +77,16 @@ you need to set num_folds to 8 for 5HT2A
 
 The molecule library for the virtual screening is 1648137 molecules inside ChemDIV.
 
-each line in result file look like this:
-
+Full mode writes two result files. `Scoring_output.txt.all_scores.txt` has every molecule in the original LMDB order:
 
 ```
-smiles,score
+index,score
+```
+
+`Scoring_output.txt` has the top 100000 molecules, highest score first. The name is the library entry (compound name or SMILES):
+
+```
+index,name,score
 ```
 
 ### For data won't fit in mem

@@ -74,7 +74,7 @@ def main(args):
 
     retrieval_bsz = args.retrieval_bsz if args.retrieval_bsz and args.retrieval_bsz > 0 else None
 
-    task.retrieval_multi_folds(model, args.pocket_path, args.save_path, args.mol_path, fold_version=args.fold_version, use_cache=args.use_cache, use_cuda=use_cuda, retrieval_mode=args.retrieval_mode, cascade_frac=args.cascade_frac, cascade_tier_fracs=args.cascade_tier_fracs, cascade_gate_folds=args.cascade_gate_folds, write_cache=args.write_cache, retrieval_bsz=retrieval_bsz, screen_folds=args.screen_folds, store_all=args.store_all, tq_bits=args.tq_bits)
+    task.retrieval_multi_folds(model, args.pocket_path, args.save_path, args.mol_path, fold_version=args.fold_version, use_cache=args.use_cache, use_cuda=use_cuda, retrieval_mode=args.retrieval_mode, cascade_frac=args.cascade_frac, cascade_tier_fracs=args.cascade_tier_fracs, cascade_gate_folds=args.cascade_gate_folds, write_cache=args.write_cache, retrieval_bsz=retrieval_bsz, screen_folds=args.screen_folds, tq_bits=args.tq_bits)
 
 
 def cli_main():
@@ -107,7 +107,6 @@ def cli_main():
     parser.add_argument("--cascade-tier-fracs", type=float_list, default=[1.0, 0.5, 0.25], help="comma-separated multipliers of --cascade-frac, one per gating tier (e.g. 1.0,0.5,0.25); the number of entries sets how many single-fold gating tiers run before the full-fold rescore")
     parser.add_argument("--cascade-gate-folds", type=int_list, default=[4, 1], help="comma-separated fold index used by each gating tier (e.g. 4,1); shorter than --cascade-tier-fracs is padded with the remaining unused folds in ascending order")
     parser.add_argument("--screen-folds", type=int_list, default=[1, 4, 5], help="comma-separated 0-based fold indices used by full-mode screening (default 1,4,5). Ignored in cascade mode.")
-    parser.add_argument("--store-all", type=str2bool, default=False, help="if True, full mode also writes <save-path>.all_scores.npy with the native score of every molecule; the top-100000 text file is still written")
     parser.add_argument("--write-cache", type=str2bool, default=True, help="persist pocket embeddings to disk (both modes). Score memmaps are always deleted after ranking. Does not gate mol caches.")
     parser.add_argument("--retrieval-bsz", type=int, default=0, help="DataLoader batch size for molecule encoding/scoring; 0 uses the internal default (384 for full mode, 64 for cascade)")
     parser.add_argument("--prefetch-factor", type=int, default=4, help="DataLoader prefetch_factor when num_workers > 0 (default 4)")

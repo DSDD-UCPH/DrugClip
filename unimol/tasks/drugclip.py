@@ -75,7 +75,8 @@ import h5py
 logger = logging.getLogger(__name__)
 
 # Fraction of the molecule library written by cascade (and cascade recall
-# diagnostics). Full mode writes a fixed top-100000 native-score shortlist.
+# diagnostics). Full mode writes every native score in LMDB order plus a
+# fixed top-100000 shortlist.
 RETRIEVAL_TOP_FRAC = 0.01
 
 # Default DataLoader batch sizes when --retrieval-bsz is 0 / unset.
@@ -1658,7 +1659,7 @@ class DrugCLIP(UnicoreTask):
         )
 
     def _select_topk_from_score_memmap(
-        self, memmap, fold_version, names, save_path, chunk_size=None, k=None, store_all=False
+        self, memmap, fold_version, names, save_path, chunk_size=None, k=None
     ):
         # Exact per-pocket median/MAD from contiguous memmap rows, then
         # molecule-chunked z-score + max-over-pockets into a (n_mols,) vector,
@@ -1705,23 +1706,18 @@ class DrugCLIP(UnicoreTask):
         else:
             top_idx = np.empty(0, dtype=np.int64)
 
+        all_path = f"{save_path}.all_scores.txt"
+        with open(all_path, "w") as f:
+            for i, score in enumerate(res_max):
+                f.write(f"{i},{score:.4f}\n")
+        logger.info(f"wrote all {n_mols} native scores to {all_path}")
+
         with open(save_path, "w") as f:
             for i in top_idx:
-                f.write(f"{names[i]},{res_max[i]:.4f}\n")
+                f.write(f"{int(i)},{names[i]},{res_max[i]:.4f}\n")
         logger.info(
             f"wrote top {k}/{n_mols}{frac_note} native scores to {save_path}"
         )
-        if store_all:
-            all_path = f"{save_path}.all_scores.npy"
-            tmp = all_path + ".tmp.npy"
-            parent = os.path.dirname(os.path.abspath(all_path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            np.save(tmp, np.ascontiguousarray(res_max, dtype=np.float32))
-            os.replace(tmp, all_path)
-            logger.info(
-                f"wrote all {n_mols} native scores to {all_path}"
-            )
         return res_max, top_idx
 
     def benchmark_mol_encoding(
@@ -2082,7 +2078,7 @@ class DrugCLIP(UnicoreTask):
         if use_cuda:
             torch.cuda.empty_cache()
 
-    def retrieval_multi_folds(self, model, pocket_path, save_path, mol_data_path, fold_version, use_cache=True, use_cuda=True, retrieval_mode="full", cascade_frac=0.2, cascade_tier_fracs=None, cascade_gate_folds=None, write_cache=True, retrieval_bsz=None, screen_folds=None, store_all=False, tq_bits=2, **kwargs):
+    def retrieval_multi_folds(self, model, pocket_path, save_path, mol_data_path, fold_version, use_cache=True, use_cuda=True, retrieval_mode="full", cascade_frac=0.2, cascade_tier_fracs=None, cascade_gate_folds=None, write_cache=True, retrieval_bsz=None, screen_folds=None, tq_bits=2, **kwargs):
         ckpts = self._fold_checkpoints(fold_version)
 
         # Encode pockets once (cheap) up front; both retrieval modes need them.
@@ -2116,10 +2112,9 @@ class DrugCLIP(UnicoreTask):
             )
         n_all_folds = len(ckpts)
         screen_folds = _resolve_screen_folds(screen_folds, n_all_folds)
-        store_all = bool(store_all)
         logger.info(
             f"full mode screen folds={screen_folds} "
-            f"topk={FULL_SCREEN_TOPK} store_all={store_all} tq_bits={tq_bits}"
+            f"topk={FULL_SCREEN_TOPK} tq_bits={tq_bits}"
         )
 
         use_fp16 = next(model.parameters()).dtype == torch.float16
@@ -2313,7 +2308,6 @@ class DrugCLIP(UnicoreTask):
             names,
             save_path,
             k=FULL_SCREEN_TOPK,
-            store_all=store_all,
         )
 
         # Always drop score memmap scratch after ranking (pocket / mol caches
@@ -2875,7 +2869,7 @@ class DrugCLIP(UnicoreTask):
             with open(save_path, "w") as f:
                 for li in top_local:
                     global_i = cur_idx[li]
-                    f.write(f"{names[global_i]},{res_max[li]:.4f}\n")
+                    f.write(f"{int(global_i)},{names[global_i]},{res_max[li]:.4f}\n")
         finally:
             if gate_encoder is not None:
                 del gate_encoder

@@ -2,8 +2,10 @@
 # Multi-target virtual screening via unimol/retrieval.py.
 #
 # Expects a folder of pocket LMDBs named <TARGET_NAME>.lmdb. Each file is
-# screened independently against the molecule library; results are written to
-# <SAVE_DIR>/<TARGET_NAME>.txt.
+# screened independently against the molecule library. Full mode writes every
+# native score in LMDB order to <SAVE_DIR>/<TARGET_NAME>.txt.all_scores.txt
+# (index,score) and the top 100000 hits to <SAVE_DIR>/<TARGET_NAME>.txt
+# (index,name,score).
 #
 # use_cache=True by default (reuse pre-encoded mol embeddings). After each
 # target finishes, per-target pocket embedding and score-memmap caches are
@@ -27,7 +29,6 @@ use_cache="${use_cache:-True}"
 #   cascade - multi-tier gating then full-fold rescore on survivors
 RETRIEVAL_MODE="${RETRIEVAL_MODE:-full}"
 SCREEN_FOLDS="${SCREEN_FOLDS:-1,4,5}"
-STORE_ALL="${STORE_ALL:-False}"
 CASCADE_FRAC="${CASCADE_FRAC:-0.2}"
 CASCADE_TIER_FRACS="${CASCADE_TIER_FRACS:-1.0,0.5,0.25}"
 CASCADE_GATE_FOLDS="${CASCADE_GATE_FOLDS:-4,1}"
@@ -127,7 +128,6 @@ for POCKET_PATH in "${POCKET_LMDBS[@]}"; do
        --use-cache "$use_cache" \
        --retrieval-mode "$RETRIEVAL_MODE" \
        --screen-folds "$SCREEN_FOLDS" \
-       --store-all "$STORE_ALL" \
        --cascade-frac "$CASCADE_FRAC" \
        --cascade-tier-fracs "$CASCADE_TIER_FRACS" \
        --cascade-gate-folds "$CASCADE_GATE_FOLDS" \

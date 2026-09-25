@@ -29,8 +29,9 @@ save_path="Scoring_output.txt"
 # Retrieval mode:
 #   full    - encode --screen-folds (default 1,4,5) over the whole library,
 #             rank with native fold-mean scores, and store TurboQuant codes
-#             (TQ_BITS, default 2; 0 disables codes). Writes the top 100000 hits unless
-#             STORE_ALL=True, which also dumps every native score.
+#             (TQ_BITS, default 2; 0 disables codes). Writes every native score
+#             in LMDB order as index,score (${save_path}.all_scores.txt) and the
+#             top 100000 hits as index,name,score (${save_path}).
 #   cascade - two-phase screening for the use_cache=False / on-the-fly case:
 #             1) run CASCADE_TIER_FRACS single-fold gating tiers (one fold each,
 #                folds taken from CASCADE_GATE_FOLDS) to progressively narrow the
@@ -43,8 +44,6 @@ RETRIEVAL_MODE=full
 SCREEN_FOLDS=1,4,5
 # TurboQuant bits for full mode: 0 = no codes, 1-4 = packed width (default 2).
 TQ_BITS=2
-# If True, also write ${save_path}.all_scores.npy (every molecule, native scores).
-STORE_ALL=False
 
 # Cascading parameters
 CASCADE_FRAC=0.2
@@ -102,7 +101,6 @@ python ./unimol/retrieval.py --user-dir ./unimol $data_path "./dict" --valid-sub
        --retrieval-mode $RETRIEVAL_MODE \
        --screen-folds $SCREEN_FOLDS \
        --tq-bits $TQ_BITS \
-       --store-all $STORE_ALL \
        --cascade-frac $CASCADE_FRAC \
        --cascade-tier-fracs $CASCADE_TIER_FRACS \
        --cascade-gate-folds $CASCADE_GATE_FOLDS \
