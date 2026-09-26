@@ -42,7 +42,7 @@ def sdf_mol_to_data(mol):
         return None
 
 
-def get_sdf_supplier(sdf_path, sanitize=True):
+def get_sdf_supplier(sdf_path, sanitize=False):
     """Streaming ForwardSDMolSupplier for plain SDF or .zst-compressed SDF.
 
     Returns (supplier, closer) where closer() releases any open file handles.
@@ -284,7 +284,7 @@ def _process_parallel(
 def process_sdf_to_lmdb(
     sdf_path,
     output_lmdb,
-    sanitize=True,
+    sanitize=False,
     workers=1,
     chunk_mols=DEFAULT_CHUNK_MOLS,
 ):
@@ -341,10 +341,16 @@ if __name__ == "__main__":
         required=True,
         help="Output LMDB path; if it ends with .zst/.zstd, whole-file compress",
     )
-    parser.add_argument(
+    san = parser.add_mutually_exclusive_group()
+    san.add_argument(
         "--no-sanitize",
         action="store_true",
-        help="Disable RDKit sanitization (on by default)",
+        help="Disable RDKit sanitization (default)",
+    )
+    san.add_argument(
+        "--sanitize",
+        action="store_true",
+        help="Enable RDKit sanitization",
     )
     parser.add_argument(
         "--workers",
@@ -367,7 +373,7 @@ if __name__ == "__main__":
     process_sdf_to_lmdb(
         sdf_path=args.sdf_path,
         output_lmdb=args.output_lmdb,
-        sanitize=not args.no_sanitize,
+        sanitize=args.sanitize,
         workers=args.workers,
         chunk_mols=args.chunk_mols,
     )
